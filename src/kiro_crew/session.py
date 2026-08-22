@@ -579,6 +579,10 @@ class SessionClosingError(RuntimeError):
     """
 
 
+class SessionBusyError(RuntimeError):
+    """A caller requested an immediate turn claim while the session was held."""
+
+
 class SpeculativeResumeRefused(RuntimeError):
     """Raised by ``get_or_create(speculative=True)`` on a resumable key.
 
@@ -1593,7 +1597,13 @@ class SessionManager:
         # Fall back OUTSIDE the lock (get_subagent_runtime takes the same lock).
         return await self.get_subagent_runtime(parent_session_key, agent=agent)
 
-    async def _reacquire_and_validate(self, key: str, sess: "_Session") -> bool:
+    async def _reacquire_and_validate(
+        self,
+        key: str,
+        sess: "_Session",
+        *,
+        wait_if_busy: bool = True,
+    ) -> bool:
         """Acquire ``sess``'s per-session semaphore, then re-validate under lock.
 
         Shared post-semaphore re-check for all three multiplexing paths
@@ -1615,6 +1625,11 @@ class SessionManager:
         avoid, and a divergent copy is exactly how the stale-provider bug class
         this audit remediates gets reintroduced.
         """
+        if not wait_if_busy and sess.semaphore.locked():
+            raise SessionBusyError(key)
+        # On an idle Semaphore(1), acquire() decrements and returns without an
+        # event-loop suspension. The preceding locked check and this claim are
+        # therefore one non-waiting concurrency boundary.
         await sess.semaphore.acquire()
         try:
             async with self._lock:
@@ -2585,6 +2600,7 @@ class SessionManager:
         extra_env: dict[str, str] | None = None,
         speculative: bool = False,
         speculative_resume: bool = False,
+        wait_if_busy: bool = True,
         _won_race_retries: int = 0,
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
@@ -2631,6 +2647,10 @@ class SessionManager:
                 ``(provider, True, True)``, preserving its
                 history-injection decision exactly as if it had performed the
                 resume itself.
+            wait_if_busy: Preserve the normal serialized wait when true. When
+                false, an existing or same-key race-winning session that is
+                already held raises :class:`SessionBusyError` at the atomic
+                semaphore claim boundary instead of joining its waiter queue.
         """
         # Fast path: existing session — hold lock only briefly
         # Fold bare/canonical Slack key aliases FIRST: the SessionMap thread
@@ -2758,7 +2778,7 @@ class SessionManager:
         # while we waited on the semaphore — if so, fall through to cold-start.
         if _claimed is not None:
             sess = _claimed
-            if await self._reacquire_and_validate(key, sess):
+            if await self._reacquire_and_validate(key, sess, wait_if_busy=wait_if_busy):
                 # Consume the one-shot first-turn observation HERE, as the
                 # semaphore owner — not at claim time under self._lock. A
                 # claimant cancelled while waiting must not destroy the
@@ -3235,7 +3255,7 @@ class SessionManager:
                     logger.warning(
                         "Failed to shut down duplicate provider for %s", key, exc_info=True
                     )
-            if await self._reacquire_and_validate(key, _won_race_sess):
+            if await self._reacquire_and_validate(key, _won_race_sess, wait_if_busy=wait_if_busy):
                 # Mirror the fast path's observation handling: when the race
                 # winner was a SPECULATIVE creator it registered the session
                 # with the first-turn observation still armed, and this loser
@@ -3270,6 +3290,7 @@ class SessionManager:
                 extra_env=extra_env,
                 speculative=speculative,
                 speculative_resume=speculative_resume,
+                wait_if_busy=wait_if_busy,
                 _won_race_retries=_won_race_retries + 1,
                 **extra_factory_kwargs,
             )

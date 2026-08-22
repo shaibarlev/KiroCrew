@@ -189,9 +189,10 @@ from kiro_crew.mcp_gateway.rewriter import (
     rewrite_agents,
 )
 from kiro_crew.memory import MemoryStore
-from kiro_crew.messaging import registry
+from kiro_crew.messaging import APPROVAL_INTERACTIVE, TurnDriver, registry
+from kiro_crew.messaging.dispatch import build_directive_consumer, build_tool_gate
 from kiro_crew.messaging.display_safety import redact_for_display
-from kiro_crew.messaging.identity import publish_turn_identity
+from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
     CHANNEL_SESSION_NAMESPACES,
     CHAT_TYPE_DIRECT,
@@ -201,13 +202,17 @@ from kiro_crew.messaging.link import (
     channel_namespace_of,
     parse_session_key,
 )
-from kiro_crew.messaging.renderer import chunk_for_transport
+from kiro_crew.messaging.renderer import SilentRenderer, chunk_for_transport
 from kiro_crew.messaging.transport import InboundMessage, delivery_confirmed
 from kiro_crew.monitoring.completion import (
     MonitorCompletionHook,
     disposition_for_stop_reason,
 )
-from kiro_crew.monitoring.models import MonitorActionDisposition
+from kiro_crew.monitoring.models import (
+    MonitorActionDisposition,
+    MonitorDispatchResult,
+    monitor_state_public_dict,
+)
 from kiro_crew.platform import boot_platform
 from kiro_crew.platform.context import (
     PlatformCompositionError,
@@ -243,7 +248,12 @@ from kiro_crew.sandbox import ensure_agents_slice_limits, warm_backend
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.service.common import restart_command_hint
-from kiro_crew.session import HEARTBEAT_KEY, SessionManager
+from kiro_crew.session import (
+    HEARTBEAT_KEY,
+    SessionBusyError,
+    SessionClosingError,
+    SessionManager,
+)
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.client import RealSlackClient
 from kiro_crew.slack.format import (
@@ -416,6 +426,17 @@ _MAX_INJECT_ATTEMPTS = 2
 # (Slack/Discord babysit loops). Mirrors HEARTBEAT_TASK_TIMEOUT_SECS / cron's
 # _JOB_TIMEOUT_SECS: no human is present, so the turn MUST be bounded.
 _NUDGE_TURN_TIMEOUT = 1800.0  # 30 min
+
+
+def _delivery_result(
+    wake_message: str | None,
+    result: MonitorDispatchResult,
+) -> bool | MonitorDispatchResult:
+    """Keep legacy bool semantics while structured delivery stays typed."""
+    if wake_message is not None:
+        return result
+    return result is MonitorDispatchResult.DISPATCHED
+
 
 # Budget for awaiting the in-flight run-marker write during shutdown. Bounded
 # so a stalled write can never eat into GRACEFUL_SHUTDOWN_SECS (which saves
@@ -5236,7 +5257,9 @@ class GatewayOrchestrator:
         )
         await self.heartbeat_svc.start()
 
-    async def _fire_slack_nudge(self, loop: NudgeLoop) -> bool:
+    async def _fire_slack_nudge(
+        self, loop: NudgeLoop, wake_message: str | None = None
+    ) -> bool | MonitorDispatchResult:
         """Drive one unattended nudge turn in a Slack thread session.
 
         Mirrors the subagent-completion Slack injection: acquire the session,
@@ -5247,10 +5270,16 @@ class GatewayOrchestrator:
         """
         key = loop.slot_key
         if self.sessions is None or self.slack is None:
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        if wake_message is not None and not await channel_inbound_permitted("slack"):
+            logger.warning(
+                "AutoNudge: Slack inbound policy denied structured wake for loop %s",
+                loop.id,
+            )
+            return MonitorDispatchResult.UNAVAILABLE
         if self.sessions.is_busy(key):
             logger.info("AutoNudge skip: slack session %s busy (loop %s)", key, loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         channel = self.sessions.get_channel(key)
         thread_ts = self.sessions.get_thread(key)
         if not thread_ts and key.startswith("slack:"):
@@ -5260,11 +5289,16 @@ class GatewayOrchestrator:
             logger.warning(
                 "AutoNudge: slack session %s unroutable — removing loop %s", key, loop.id
             )
-            if self.autonudge_svc:
+            if self.autonudge_svc and wake_message is None:
                 await self.autonudge_svc.remove(loop.id)
-            return False
-        msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
-        tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+            return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
+        if wake_message is None:
+            msg_body = await compose_nudge_body(
+                loop.message, loop.stop_sentinel_path, loop.slot_key
+            )
+            tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+        else:
+            tagged = wake_message
         # Fail closed: an unattended turn MUST run under the HookManager
         # PreToolUse governance gate (mirrors cron's default approval path).
         # Without ctx_builder there are no hooks to enforce the gate — skip.
@@ -5275,50 +5309,109 @@ class GatewayOrchestrator:
                 key,
                 loop.id,
             )
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         response: str | None = None
         _acquired = False
+        _turn_started = False
+        _driver_completion_hook: MonitorCompletionHook | None = None
+        _completion_hook: MonitorCompletionHook | None = None
+        _raw_dispositions: list[MonitorActionDisposition] = []
+        _completion_reported = False
         try:
-            client, is_new, _resumed = await self.sessions.get_or_create(key)
+            if wake_message is None:
+                client, is_new, _resumed = await self.sessions.get_or_create(key)
+            else:
+                client, is_new, _resumed = await self.sessions.get_or_create(
+                    key, wait_if_busy=False
+                )
             _acquired = True
             _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
             full_msg, _ = await run_in_embed_pool(
                 self.ctx_builder.build_message, tagged, is_new, key, provider_type=_provider
             )
-            _raw_completions: list[LLMEvent] = []
             _completion_hook = self._monitor_completion_hook(loop)
-            _completion_kwargs: dict[str, Any] = {}
-            if _completion_hook is not None:
-                _completion_kwargs["on_complete"] = _raw_completions.append
+            if wake_message is not None and _completion_hook is None:
+                return MonitorDispatchResult.UNAVAILABLE
             # Clock started outside wait_for so BOTH the success path and the
             # TimeoutError branch below can report the real elapsed time. acp
             # never assigns TurnUsage.duration_ms, so the row needs this.
             _turn_t0 = time.monotonic()
-            response = await asyncio.wait_for(
-                stream_and_collect(
+            _turn_started = True
+            if wake_message is None:
+
+                def _capture_raw_completion(event: LLMEvent) -> None:
+                    _raw_dispositions.append(disposition_for_stop_reason(event.stop_reason))
+
+                response = await asyncio.wait_for(
+                    stream_and_collect(
+                        client,
+                        full_msg,
+                        retry_transient=False,
+                        # Same governance contract as unattended cron turns: the
+                        # HookManager PreToolUse gate decides tool approvals, and
+                        # anything it can't decide goes to the deny-fast
+                        # background-approval window (source "autonudge").
+                        approval_policy=ToolApprovalPolicy.HOOK_BASED,
+                        hooks=self.ctx_builder.hooks,
+                        on_tool_approval=self._interactive_approval("autonudge", nudge_key=key),
+                        on_complete=_capture_raw_completion,
+                    ),
+                    timeout=_NUDGE_TURN_TIMEOUT,
+                )
+            else:
+
+                async def _capture_completion(completion: Any) -> None:
+                    _raw_dispositions.append(completion.disposition)
+
+                approval = self._interactive_approval("autonudge", nudge_key=key)
+                sessions = self.sessions
+                assert sessions is not None
+                driver = TurnDriver(
                     client,
-                    full_msg,
-                    retry_transient=False,
-                    # Same governance contract as unattended cron turns: the
-                    # HookManager PreToolUse gate decides tool approvals, and
-                    # anything it can't decide goes to the deny-fast
-                    # background-approval window (source "autonudge").
-                    approval_policy=ToolApprovalPolicy.HOOK_BASED,
-                    hooks=self.ctx_builder.hooks,
-                    on_tool_approval=self._interactive_approval("autonudge", nudge_key=key),
-                    **_completion_kwargs,
-                ),
-                timeout=_NUDGE_TURN_TIMEOUT,
-            )
+                    SilentRenderer(channel_type="slack"),
+                    approval_mode=APPROVAL_INTERACTIVE,
+                    decider=approval,
+                    tool_gate=build_tool_gate(
+                        self.ctx_builder,
+                        session_key=key,
+                        agent=_get_agent_for_session(key) or "",
+                    ),
+                    directive_consumer=build_directive_consumer(
+                        session_key=key,
+                        sessions=self.sessions,
+                    ),
+                    monitor_completion=(
+                        (
+                            _driver_completion_hook := MonitorCompletionHook(
+                                _completion_hook.monitor_id,
+                                _completion_hook.fingerprint,
+                                _capture_completion,
+                                authorization_callback=_completion_hook.authorization_callback,
+                            )
+                        )
+                        if _completion_hook is not None
+                        else None
+                    ),
+                    turn_start_guard=lambda: sessions.begin_turn(key),
+                )
+                response = await asyncio.wait_for(
+                    driver.run(full_msg),
+                    timeout=_NUDGE_TURN_TIMEOUT,
+                )
+                if _driver_completion_hook is None or not _driver_completion_hook.accepted:
+                    return MonitorDispatchResult.UNAVAILABLE
+                assert _completion_hook is not None
+                _completion_hook.mark_accepted()
             _turn_usage = provider_last_turn_usage(client)
 
-            if _raw_completions:
+            if _raw_dispositions:
                 await self._report_monitor_completion(
                     loop,
-                    disposition_for_stop_reason(_raw_completions[-1].stop_reason),
+                    _raw_dispositions[-1],
                     _turn_usage,
                     hook=_completion_hook,
                 )
+                _completion_reported = True
             # ── Per-turn usage row: attribute monitor spend. ──
             await _persist_turn_row(
                 client,
@@ -5329,6 +5422,29 @@ class GatewayOrchestrator:
                 t0=_turn_t0,
                 usage=_turn_usage,
             )
+        except SessionBusyError:
+            logger.info(
+                "AutoNudge skip: slack session %s won by another turn (loop %s)",
+                key,
+                loop.id,
+            )
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        except SessionClosingError:
+            logger.info(
+                "AutoNudge: refusing Slack monitor turn for %s during shutdown",
+                key,
+            )
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        except asyncio.CancelledError:
+            if _turn_started and _raw_dispositions and not _completion_reported:
+                _turn_usage = provider_last_turn_usage(client)
+                await self._report_monitor_completion(
+                    loop,
+                    _raw_dispositions[-1],
+                    _turn_usage,
+                    hook=_completion_hook,
+                )
+            raise
         except asyncio.TimeoutError:
             # ── Timeout spend is REAL spend (issue #874 follow-up). ──
             # A timed-out nudge turn previously fell through to the generic
@@ -5346,10 +5462,10 @@ class GatewayOrchestrator:
                 loop.id,
             )
             _turn_usage = provider_last_turn_usage(client)
-            if _raw_completions:
+            if _raw_dispositions:
                 await self._report_monitor_completion(
                     loop,
-                    disposition_for_stop_reason(_raw_completions[-1].stop_reason),
+                    _raw_dispositions[-1],
                     _turn_usage,
                     hook=_completion_hook,
                 )
@@ -5362,10 +5478,25 @@ class GatewayOrchestrator:
                 t0=_turn_t0,
                 usage=_turn_usage,
             )
-            return False
+            if wake_message is None:
+                return False
+            return MonitorDispatchResult.DISPATCHED
         except Exception:
             logger.exception("AutoNudge: slack nudge turn failed for %s (loop %s)", key, loop.id)
-            return False
+            if (
+                wake_message is not None
+                and _driver_completion_hook is not None
+                and _driver_completion_hook.accepted
+            ):
+                assert _completion_hook is not None
+                _completion_hook.mark_accepted()
+                return MonitorDispatchResult.DISPATCHED
+            result = (
+                MonitorDispatchResult.DISPATCHED if _turn_started else MonitorDispatchResult.BUSY
+            )
+            if wake_message is None:
+                return False
+            return result
         finally:
             if _acquired:
                 try:
@@ -5402,9 +5533,11 @@ class GatewayOrchestrator:
                 )
             except Exception:
                 logger.warning("AutoNudge: failed to persist nudge turn for %s", key, exc_info=True)
-        return True
+        return _delivery_result(wake_message, MonitorDispatchResult.DISPATCHED)
 
-    async def _fire_discord_nudge(self, loop: NudgeLoop) -> bool:
+    async def _fire_discord_nudge(
+        self, loop: NudgeLoop, wake_message: str | None = None
+    ) -> bool | MonitorDispatchResult:
         """Drive one unattended nudge turn in a Discord DM session.
 
         Synthesizes an ``InboundMessage`` and routes it through the Discord
@@ -5419,14 +5552,14 @@ class GatewayOrchestrator:
         dispatcher = transport.dispatcher if transport is not None else None
         if transport is None or dispatcher is None:
             logger.info("AutoNudge skip: discord transport not running (loop %s)", loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         # Key shape: discord:{agent}:direct:{user_id}[:genN]
         parts = key.split(":")
         if len(parts) < 4 or parts[2] != "direct":
             logger.warning("AutoNudge: unsupported discord key %s — removing loop %s", key, loop.id)
-            if self.autonudge_svc:
+            if self.autonudge_svc and wake_message is None:
                 await self.autonudge_svc.remove(loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         user_id = parts[3]
         # Defense-in-depth: re-check the inbound allowlist at fire time (the
         # create endpoint enforces it too, but the allowlist can shrink after
@@ -5441,9 +5574,9 @@ class GatewayOrchestrator:
                 user_id,
                 loop.id,
             )
-            if self.autonudge_svc:
+            if self.autonudge_svc and wake_message is None:
                 await self.autonudge_svc.remove(loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         # Generation guard: the dispatcher derives the CURRENT key for this
         # user (dm_scope + `!new` generation). If it no longer matches the
         # loop's stored key, the monitored conversation is gone — a synthetic
@@ -5461,17 +5594,31 @@ class GatewayOrchestrator:
                 current_key,
                 loop.id,
             )
-            if self.autonudge_svc:
+            if self.autonudge_svc and wake_message is None:
                 await self.autonudge_svc.remove(loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         sessions = getattr(dispatcher, "sessions", None)
         if sessions is not None and sessions.is_busy(key):
             logger.info("AutoNudge skip: discord session %s busy (loop %s)", key, loop.id)
-            return False
-        msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
-        tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        if wake_message is None:
+            msg_body = await compose_nudge_body(
+                loop.message, loop.stop_sentinel_path, loop.slot_key
+            )
+            tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+        else:
+            tagged = wake_message
         try:
             conversation_id = await transport.resolve_conversation(user_id)
+        except Exception:
+            logger.exception(
+                "AutoNudge: discord conversation lookup failed for %s (loop %s)",
+                key,
+                loop.id,
+            )
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        completion_hook: MonitorCompletionHook | None = None
+        try:
             synthetic = InboundMessage(
                 channel_type="discord",
                 user_id=user_id,
@@ -5480,16 +5627,32 @@ class GatewayOrchestrator:
             )
             dispatch_kwargs: dict[str, Any] = {"interpret_commands": False}
             completion_hook = self._monitor_completion_hook(loop)
+            if wake_message is not None and completion_hook is None:
+                return MonitorDispatchResult.UNAVAILABLE
             if completion_hook is not None:
                 dispatch_kwargs["monitor_completion"] = completion_hook
-            await asyncio.wait_for(
-                dispatcher.handle_message(synthetic, **dispatch_kwargs),
+                dispatch_kwargs["monitor_session_key"] = key
+            dispatch = dispatcher.handle_message(synthetic, **dispatch_kwargs)
+            dispatch_result = await asyncio.wait_for(
+                dispatch,
                 timeout=_NUDGE_TURN_TIMEOUT,
             )
+            if wake_message is not None:
+                return (
+                    dispatch_result
+                    if isinstance(dispatch_result, MonitorDispatchResult)
+                    else MonitorDispatchResult.UNAVAILABLE
+                )
+            if completion_hook is not None and isinstance(dispatch_result, MonitorDispatchResult):
+                return dispatch_result is MonitorDispatchResult.DISPATCHED
             return True
         except Exception:
             logger.exception("AutoNudge: discord nudge failed for %s (loop %s)", key, loop.id)
-            return False
+            if wake_message is None:
+                return False
+            if completion_hook is not None and completion_hook.accepted:
+                return MonitorDispatchResult.DISPATCHED
+            return MonitorDispatchResult.UNAVAILABLE
 
     async def _fire_webex_nudge(self, loop: NudgeLoop) -> bool:
         """Drive one unattended nudge turn in a Webex DM session.
@@ -5587,7 +5750,9 @@ class GatewayOrchestrator:
             logger.exception("AutoNudge: webex nudge failed (loop %s)", loop.id)
             return False
 
-    async def _fire_dashboard_nudge(self, loop: NudgeLoop) -> bool:
+    async def _fire_dashboard_nudge(
+        self, loop: NudgeLoop, wake_message: str | None = None
+    ) -> bool | MonitorDispatchResult:
         """Drive one nudge turn in a dashboard chat slot.
 
         Sibling of :meth:`_fire_slack_nudge` / :meth:`_fire_discord_nudge`; a
@@ -5603,7 +5768,7 @@ class GatewayOrchestrator:
         # entirely in --no-dashboard mode. Mirrors _observer's guard.
         if self.dashboard_state is None:
             logger.warning("AutoNudge: dashboard not ready — skipping fire for loop %s", loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         # Slot resolution mirrors the cron→origin delivery contract in
         # dashboard/handlers/messaging.py: get_slot() is the hot path, and a
         # miss falls back to restoring the session from its persisted history
@@ -5652,15 +5817,19 @@ class GatewayOrchestrator:
                     loop.slot_key,
                     loop.id,
                 )
-                await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
-                return False
+                if wake_message is None:
+                    await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
+                return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
             logger.info(
                 "AutoNudge: rehydrated session %s from history for loop %s",
                 loop.slot_key,
                 loop.id,
             )
-        msg = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
-        tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
+        if wake_message is None:
+            msg = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
+            tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
+        else:
+            tagged = wake_message
         from kiro_crew.dashboard.chat import (
             _run_chat,  # circular import: gateway -> dashboard.chat -> gateway (chat dispatch references GatewayOrchestrator)
         )
@@ -5679,7 +5848,7 @@ class GatewayOrchestrator:
                 loop.id,
                 loop.cycle_count,
             )
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         # Show nudge as a distinct "nudge" role message in the slot history.
         # The structured meta lets the dashboard render a compact cycle chip
         # instead of echoing the whole instruction payload as a chat bubble.
@@ -5687,46 +5856,127 @@ class GatewayOrchestrator:
         # and the body is deliberately NOT duplicated into meta — the client
         # derives it from content, so a multi-KB payload is stored and
         # broadcast once rather than twice.
-        slot.append(
-            "nudge",
-            tagged,
-            "msg msg-nudge",
-            meta={
-                "nudge": {
-                    "cycle": loop.cycle_count + 1,
-                    "loop_id": loop.id,
-                }
-            },
-        )
+        nudge_meta: dict[str, Any] = {
+            "nudge": {
+                "cycle": loop.cycle_count + 1,
+                "loop_id": loop.id,
+            }
+        }
+        if wake_message is not None and loop.monitor is not None:
+            nudge_meta["monitor"] = {
+                "id": loop.id,
+                "fingerprint": loop.monitor.last_wake_fingerprint,
+                "classification": (
+                    loop.monitor.last_decision.value
+                    if loop.monitor.last_decision is not None
+                    else "actionable"
+                ),
+            }
+        completion_hook = self._monitor_completion_hook(loop)
+        if wake_message is not None and completion_hook is None:
+            return MonitorDispatchResult.UNAVAILABLE
+        dashboard_state = self.dashboard_state
+        turn_slot = slot
+        assert dashboard_state is not None and turn_slot is not None
+
+        def _append_nudge() -> None:
+            turn_slot.append(
+                "nudge",
+                tagged,
+                "msg msg-nudge",
+                meta=nudge_meta,
+            )
+
+        if completion_hook is None:
+            _append_nudge()
         # FIX 2: an unattended app-owned nudge turn runs under the background
         # concurrency cap. This is the fleet's hot path — N armed loops fire
         # independently and would otherwise put N turns on the runtime at once.
         # An attended slot (any user session with a monitor loop) is passed
         # straight through, so babysit loops on human sessions are unaffected.
+        admission: asyncio.Future[MonitorDispatchResult] | None = None
+        if completion_hook is not None:
+            admission = asyncio.get_running_loop().create_future()
+
+        def _settle_admission(result: MonitorDispatchResult) -> None:
+            if admission is not None and not admission.done():
+                admission.set_result(result)
+
+        if completion_hook is not None:
+            base_hook = completion_hook
+
+            async def _authorize_dashboard_turn(monitor_id: str, fingerprint: str) -> bool:
+                callback = base_hook.authorization_callback
+                authorized = True if callback is None else await callback(monitor_id, fingerprint)
+                if not authorized:
+                    _settle_admission(MonitorDispatchResult.UNAVAILABLE)
+                return authorized
+
+            def _accept_dashboard_turn() -> None:
+                _append_nudge()
+                _settle_admission(MonitorDispatchResult.DISPATCHED)
+
+            completion_hook = MonitorCompletionHook(
+                base_hook.monitor_id,
+                base_hook.fingerprint,
+                base_hook.callback,
+                authorization_callback=_authorize_dashboard_turn,
+                acceptance_callback=_accept_dashboard_turn,
+            )
+
         run_kwargs: dict[str, Any] = {}
-        completion_hook = self._monitor_completion_hook(loop)
         if completion_hook is not None:
             run_kwargs["monitor_completion"] = completion_hook
-        task = spawn_guarded_turn(
-            self.dashboard_state,
-            slot,
-            self.dashboard_state.run_background_turn(
-                slot,
-                _run_chat(
-                    self.dashboard_state,
-                    slot,
-                    tagged,
-                    _directive_user_origin=False,
-                    **run_kwargs,
-                ),
-            ),
-        )
+            # Structured monitor turns own a single durable budgeted turn.
+            # Nested depth disables dashboard recovery paths that would enqueue
+            # an additional provider turn outside that accounting boundary.
+            run_kwargs["_prompt_depth"] = 1
+
+        async def _run_dashboard_turn() -> None:
+            # Unattended slots can wait behind the background-turn semaphore.
+            # The runner revalidates a structured claim after every pre-turn
+            # await and immediately before provider entry.
+            await _run_chat(
+                dashboard_state,
+                turn_slot,
+                tagged,
+                _directive_user_origin=False,
+                **run_kwargs,
+            )
+
+        async def _run_background_turn() -> None:
+            try:
+                await dashboard_state.run_background_turn(turn_slot, _run_dashboard_turn())
+            except TimeoutError:
+                _settle_admission(MonitorDispatchResult.BUSY)
+            except asyncio.CancelledError:
+                _settle_admission(MonitorDispatchResult.BUSY)
+                raise
+            except Exception:
+                _settle_admission(MonitorDispatchResult.UNAVAILABLE)
+                raise
+
+        if admission is not None:
+            turn_coro = _run_background_turn()
+        else:
+            turn_coro = dashboard_state.run_background_turn(
+                turn_slot,
+                _run_dashboard_turn(),
+            )
+        task = spawn_guarded_turn(dashboard_state, turn_slot, turn_coro)
         # Mirror dashboard /api/chat/send path so slot.running == True and sidebar
         # shows the "turn active" three-dots indicator immediately.
         slot.task = task
         self._session_tasks[slot.key] = task
         self.dashboard_state.push_slots_update()
-        return True
+        if admission is not None:
+
+            def _settle_unstarted_admission(_task: asyncio.Task[Any]) -> None:
+                _settle_admission(MonitorDispatchResult.BUSY)
+
+            task.add_done_callback(_settle_unstarted_admission)
+            return _delivery_result(wake_message, await admission)
+        return _delivery_result(wake_message, MonitorDispatchResult.DISPATCHED)
 
     def _monitor_completion_hook(self, loop: NudgeLoop) -> MonitorCompletionHook | None:
         """Bind a structured loop's in-flight identity to controller accounting."""
@@ -5740,6 +5990,7 @@ class GatewayOrchestrator:
             loop.id,
             state.last_wake_fingerprint,
             service.record_monitor_turn_completion,
+            authorization_callback=getattr(service, "monitor_dispatch_is_authorized", None),
         )
 
     async def _report_monitor_completion(
@@ -5770,6 +6021,11 @@ class GatewayOrchestrator:
             logger.info("AutoNudge disabled via feature flag")
             return
 
+        # Keep the disabled gateway boot path free of controller and provider
+        # imports. Provider adapters load credentials and client dependencies
+        # that a gateway with automation disabled never uses.
+        from kiro_crew.monitoring.controller import MonitorController
+
         async def _fire(loop: NudgeLoop) -> bool:
             """Inject nudge message into the bound session.
 
@@ -5784,9 +6040,13 @@ class GatewayOrchestrator:
             """
             if is_channel_key(loop.slot_key):
                 if loop.slot_key.startswith("slack:"):
-                    return await self._fire_slack_nudge(loop)
+                    result = await self._fire_slack_nudge(loop)
+                    assert isinstance(result, bool)
+                    return result
                 if loop.slot_key.startswith("discord:"):
-                    return await self._fire_discord_nudge(loop)
+                    result = await self._fire_discord_nudge(loop)
+                    assert isinstance(result, bool)
+                    return result
                 if loop.slot_key.startswith("webex:"):
                     return await self._fire_webex_nudge(loop)
                 logger.warning(
@@ -5796,32 +6056,71 @@ class GatewayOrchestrator:
                 )
                 await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
                 return False
-            return await self._fire_dashboard_nudge(loop)
+            result = await self._fire_dashboard_nudge(loop)
+            assert isinstance(result, bool)
+            return result
+
+        async def _fire_monitor(loop: NudgeLoop, envelope: str) -> MonitorDispatchResult:
+            """Route one controller-owned envelope without legacy decoration."""
+            if loop.slot_key.startswith("slack:"):
+                result = await self._fire_slack_nudge(loop, envelope)
+                assert isinstance(result, MonitorDispatchResult)
+                return result
+            if loop.slot_key.startswith("discord:"):
+                result = await self._fire_discord_nudge(loop, envelope)
+                assert isinstance(result, MonitorDispatchResult)
+                return result
+            if is_channel_key(loop.slot_key):
+                return MonitorDispatchResult.UNAVAILABLE
+            result = await self._fire_dashboard_nudge(loop, envelope)
+            assert isinstance(result, MonitorDispatchResult)
+            return result
+
+        controller: MonitorController | None = None
+
+        async def _monitor_tick(loop: NudgeLoop) -> None:
+            if controller is not None:
+                await controller.tick(loop, now=time.time())
 
         def _observer(event: str, loop: NudgeLoop | None) -> None:
             if event == "expired" and loop is not None:
                 self._notify_nudge_expired(loop)
             if self.dashboard_state and loop is not None:
-                self.dashboard_state.broadcast_ws(
+                loop_payload: dict[str, Any] = {
+                    "id": loop.id,
+                    "slot_key": loop.slot_key,
+                    "message": loop.message,
+                    "idle_secs": loop.idle_secs,
+                    "max_cycles": loop.max_cycles,
+                    "max_runtime_secs": loop.max_runtime_secs,
+                    "cycle_count": loop.cycle_count,
+                    "active": loop.active,
+                    "last_fire_ts": loop.last_fire_ts,
+                }
+                if loop.monitor is not None:
+                    loop_payload["monitor"] = monitor_state_public_dict(loop.monitor)
+                    loop_payload["next_due_ts"] = loop.next_due_ts
+                    loop_payload["stopped_reason"] = loop.stopped_reason
+                broadcast = (
+                    self.dashboard_state.broadcast_ws_owners
+                    if loop.monitor is not None
+                    else self.dashboard_state.broadcast_ws
+                )
+                broadcast(
                     "autonudge_state",
                     {
                         "event": event,
                         "slot": loop.slot_key,
-                        "loop": {
-                            "id": loop.id,
-                            "slot_key": loop.slot_key,
-                            "message": loop.message,
-                            "idle_secs": loop.idle_secs,
-                            "max_cycles": loop.max_cycles,
-                            "max_runtime_secs": loop.max_runtime_secs,
-                            "cycle_count": loop.cycle_count,
-                            "active": loop.active,
-                            "last_fire_ts": loop.last_fire_ts,
-                        },
+                        "loop": loop_payload,
                     },
                 )
 
-        self.autonudge_svc = AutoNudgeService(base_dir=data_home(), on_fire=_fire)
+        self.autonudge_svc = AutoNudgeService(
+            base_dir=data_home(),
+            on_fire=_fire,
+            on_monitor_tick=_monitor_tick,
+        )
+        controller = MonitorController(self.autonudge_svc, _fire_monitor)
         self.autonudge_svc.subscribe(_observer)
         await self.autonudge_svc.start()
 

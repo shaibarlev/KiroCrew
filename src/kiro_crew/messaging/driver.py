@@ -306,6 +306,11 @@ class TurnDriver:
         transports. Injected by the caller with its own session key bound, so
         the driver stays channel-neutral. When omitted, directive markers are
         ignored exactly as before.
+    turn_start_guard:
+        Optional synchronous gate invoked immediately before the provider stream
+        starts. Callers use it to reject a lease that shutdown can no longer
+        drain. It must not await: the guard and the stream's synchronous turn
+        registration are one event-loop span.
     """
 
     def __init__(
@@ -321,6 +326,7 @@ class TurnDriver:
         tool_gate: Callable[[Any], str] | None = None,
         directive_consumer: DirectiveConsumer | None = None,
         monitor_completion: MonitorCompletionHook | None = None,
+        turn_start_guard: Callable[[], None] | None = None,
     ) -> None:
         self.provider = provider
         self.renderer = renderer
@@ -342,6 +348,7 @@ class TurnDriver:
         # identity was recorded at EVENT_TOOL_CALL — the forgery gate.
         self.directive_consumer = directive_consumer
         self.monitor_completion = monitor_completion
+        self.turn_start_guard = turn_start_guard
 
     async def run(self, message: str) -> str:
         """Drive one turn; return the accumulated channel-safe assistant text."""
@@ -413,6 +420,13 @@ class TurnDriver:
                 )
 
         await self.renderer.on_turn_start()
+        if self.monitor_completion is not None:
+            if not await self.monitor_completion.authorize():
+                return accumulated
+        if self.turn_start_guard is not None:
+            self.turn_start_guard()
+        if self.monitor_completion is not None:
+            self.monitor_completion.mark_accepted()
         async for event in self.provider.stream(message):
             kind = event.kind
             if kind == EVENT_TEXT_CHUNK:

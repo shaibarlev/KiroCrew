@@ -36,22 +36,32 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
+from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterator
 
 from kiro_crew import platform_compat, shutdown_event
 from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.loader import config_dir, data_home
 from kiro_crew.config.paths import legacy_home
-from kiro_crew.monitoring.decision import monitor_budget_reason
+from kiro_crew.monitoring.decision import decide_monitor, monitor_budget_reason
 from kiro_crew.monitoring.models import (
+    MONITOR_BUSY_RETRY_SECS,
+    MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS,
     MONITOR_STATE_VERSION,
     MONITOR_STOP_APPROVAL_STALL,
     MONITOR_STOP_COMPLETION_UNAVAILABLE,
+    MONITOR_STOP_SESSION_CLOSE,
+    MONITOR_STOP_SESSION_UNAVAILABLE,
     MONITOR_STOP_UNSUPPORTED_VERSION,
+    MONITOR_STOP_USER,
     MonitorActionCompletion,
     MonitorActionDisposition,
+    MonitorBudgets,
+    MonitorDecision,
+    MonitorDispatchResult,
+    MonitorObservationStatus,
     MonitorOutcome,
     MonitorState,
     monitor_state_from_dict,
@@ -59,6 +69,9 @@ from kiro_crew.monitoring.models import (
     quarantine_monitor_state,
 )
 from kiro_crew.security import is_sensitive_path
+
+if TYPE_CHECKING:
+    from kiro_crew.monitoring.github_pull_request import GitHubPullRequestProbeResult
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +87,8 @@ _MAX_IDLE_SECS = 86400  # 24h
 _REARM_BACKOFF_SECS = 15
 _REARM_MAX_BACKOFF_SECS = 300  # 5m ceiling for the escalated re-arm delay
 _REARM_BACKOFF_MAX_SHIFT = 16  # clamp the 2**shift exponent
+_MONITOR_RETRY_BACKOFF_SECS = 15
+_MONITOR_RETRY_MAX_BACKOFF_SECS = 300
 
 # Re-arm delay when a loop's deadline has already passed while a user turn was
 # in flight. Small but non-zero: firing the instant the user's turn ends would
@@ -202,6 +217,19 @@ def binding_key_for(session_key: str) -> str | None:
     if session_key.startswith(("slack:", "discord:", "webex:")):
         return session_key
     return None
+
+
+def structured_monitor_binding_key_for(session_key: str) -> str | None:
+    """Return a binding only when structured wake delivery is supported.
+
+    Legacy prompt loops have a Webex fire adapter. Structured monitors require
+    typed dispatch and completion correlation, which currently exist only for
+    dashboard, Slack, and Discord sessions.
+    """
+    binding = binding_key_for(session_key)
+    if binding is None or binding.startswith("webex:"):
+        return None
+    return binding
 
 
 def enabled() -> bool:
@@ -445,6 +473,10 @@ class NudgeLoop:
     monitor: MonitorState | None = None
 
 
+class MonitorUpdateConflict(ValueError):
+    """A structured mutation would break active action correlation."""
+
+
 def _repair_number(
     value: Any, *, lo: float, fallback: float, hi: float | None = None
 ) -> tuple[float, bool]:
@@ -510,10 +542,12 @@ class AutoNudgeService:
         self,
         base_dir: Path | None = None,
         on_fire: Callable[[NudgeLoop], Awaitable[bool]] | None = None,
+        on_monitor_tick: Callable[[NudgeLoop], Awaitable[None]] | None = None,
     ) -> None:
         self._base_dir = base_dir or config_dir()
         self._path = self._base_dir / _NUDGES_FILE
         self._on_fire = on_fire
+        self._on_monitor_tick = on_monitor_tick
         self._loops: dict[str, NudgeLoop] = {}
         self._timers: dict[str, asyncio.Task] = {}
         # Loop ids whose re-arm was requested while their fire window was open.
@@ -590,20 +624,43 @@ class AutoNudgeService:
                         # rewriting the active intent a newer gateway needs.
                         loop.monitor.outcome = MonitorOutcome.BLOCKED
                         loop.monitor.stopped_reason = MONITOR_STOP_UNSUPPORTED_VERSION
-                    elif loop.monitor.wake_in_flight:
-                        # A persisted claim proves dispatch was acknowledged but
-                        # says nothing about whether the process died before or
-                        # after the turn completed. Retire it deterministically:
-                        # charging would invent work, while clearing the wake
-                        # fingerprint would permit an immediate duplicate.
-                        loop.monitor.wake_in_flight = False
-                        if loop.monitor.outcome is None:
-                            loop.monitor.outcome = MonitorOutcome.BLOCKED
-                            loop.monitor.stopped_reason = MONITOR_STOP_COMPLETION_UNAVAILABLE
+                    elif loop.monitor.outcome is not None:
+                        # A terminal record is inspectable, never schedulable,
+                        # even when a hand-edited store contradicts itself.
+                        if loop.active or loop.monitor.wake_in_flight or loop.next_due_ts:
+                            self._store_dirty = True
                         loop.active = False
+                        loop.monitor.wake_in_flight = False
+                        loop.monitor.completion_evidence_deadline = 0.0
                         loop.next_due_ts = 0.0
-                        self._store_dirty = True
-                    elif loop.active:
+                    elif loop.monitor.wake_in_flight:
+                        if (
+                            loop.monitor.wake_delivery is MonitorDispatchResult.BUSY
+                            and loop.next_due_ts > 0
+                        ):
+                            # BUSY proves no action turn started. Resume the
+                            # already-claimed wake at its persisted retry instead
+                            # of treating the intentionally empty evidence
+                            # deadline as an ambiguous accepted dispatch.
+                            if loop.monitor.next_probe_at != loop.next_due_ts:
+                                loop.monitor.next_probe_at = loop.next_due_ts
+                                self._store_dirty = True
+                        elif loop.monitor.completion_evidence_deadline <= 0:
+                            # A persisted claim with no accepted-dispatch
+                            # deadline may have died on either side of handoff.
+                            # Retire it without charging or redispatching.
+                            loop.monitor.wake_in_flight = False
+                            if loop.monitor.outcome is None:
+                                loop.monitor.outcome = MonitorOutcome.BLOCKED
+                                loop.monitor.stopped_reason = MONITOR_STOP_COMPLETION_UNAVAILABLE
+                            loop.active = False
+                            loop.next_due_ts = 0.0
+                            self._store_dirty = True
+                        elif loop.next_due_ts != loop.monitor.completion_evidence_deadline:
+                            loop.next_due_ts = loop.monitor.completion_evidence_deadline
+                            loop.monitor.next_probe_at = loop.next_due_ts
+                            self._store_dirty = True
+                    elif loop.active and self._on_monitor_tick is None:
                         # Structured monitor delivery belongs to the controller,
                         # which is intentionally not wired in this substrate.
                         # Deactivate rather than allowing the legacy timer to
@@ -636,6 +693,15 @@ class AutoNudgeService:
                     fallback=float(_MIN_IDLE_SECS),
                 )
                 loop.idle_secs = int(idle_num)
+                if (
+                    loop.monitor is not None
+                    and loop.monitor.version == MONITOR_STATE_VERSION
+                    and loop.monitor.next_probe_at != loop.next_due_ts
+                ):
+                    # NudgeLoop owns the restart schedule; the monitor field is
+                    # its atomically-persisted inspection mirror.
+                    loop.monitor.next_probe_at = loop.next_due_ts
+                    self._store_dirty = True
                 if due_repaired or idle_repaired:
                     self._store_dirty = True
             except Exception:
@@ -853,6 +919,7 @@ class AutoNudgeService:
         stop_sentinel_path: str = "",
         max_runtime_secs: int = 0,
         admission_check: Callable[[], bool] | None = None,
+        replace_existing: bool = True,
     ) -> NudgeLoop:
         # CANCELLATION SAFETY: the mutate+persist runs as a SHIELDED task. If
         # the awaiting caller is cancelled mid-write, a bare await would release
@@ -875,6 +942,7 @@ class AutoNudgeService:
                 stop_sentinel_path=stop_sentinel_path,
                 max_runtime_secs=max_runtime_secs,
                 admission_check=admission_check,
+                replace_existing=replace_existing,
             )
         )
         self._inflight_adds.add(inner)
@@ -887,6 +955,127 @@ class AutoNudgeService:
         inner.add_done_callback(_finish)
         return await asyncio.shield(inner)
 
+    async def add_monitor(
+        self,
+        *,
+        slot_key: str,
+        kind: str,
+        target: str,
+        objective: str,
+        cadence_secs: int,
+        budgets: MonitorBudgets,
+        wake_instructions: str = "",
+        now: float | None = None,
+        replace_existing: bool = True,
+        expected_existing_monitor_id: str | None = None,
+        expected_existing_config_generation: int | None = None,
+        admission_check: Callable[[], bool] | None = None,
+    ) -> NudgeLoop:
+        """Create one durable structured record without legacy prompt routing."""
+        inner: "asyncio.Task[NudgeLoop]" = asyncio.ensure_future(
+            self._add_monitor_locked(
+                slot_key=slot_key,
+                kind=kind,
+                target=target,
+                objective=objective,
+                cadence_secs=cadence_secs,
+                budgets=budgets,
+                wake_instructions=wake_instructions,
+                now=now,
+                replace_existing=replace_existing,
+                expected_existing_monitor_id=expected_existing_monitor_id,
+                expected_existing_config_generation=expected_existing_config_generation,
+                admission_check=admission_check,
+            )
+        )
+        self._inflight_adds.add(inner)
+
+        def _finish(t: "asyncio.Task[NudgeLoop]") -> None:
+            self._inflight_adds.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.warning("detached structured monitor add failed", exc_info=t.exception())
+
+        inner.add_done_callback(_finish)
+        return await asyncio.shield(inner)
+
+    async def _add_monitor_locked(
+        self,
+        *,
+        slot_key: str,
+        kind: str,
+        target: str,
+        objective: str,
+        cadence_secs: int,
+        budgets: MonitorBudgets,
+        wake_instructions: str,
+        now: float | None,
+        replace_existing: bool,
+        expected_existing_monitor_id: str | None,
+        expected_existing_config_generation: int | None,
+        admission_check: Callable[[], bool] | None,
+    ) -> NudgeLoop:
+        created = time.time() if now is None else now
+        cadence = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(cadence_secs)))
+        async with _maintenance_lock(self._base_dir):
+            async with self._lock:
+                if admission_check is not None and not admission_check():
+                    raise NudgeAdmissionRefused("session changed before monitor arm committed")
+                existing = self._find_by_slot(slot_key)
+                if expected_existing_monitor_id is not None:
+                    existing_monitor = existing.monitor if existing is not None else None
+                    if (
+                        existing is None
+                        or existing.id != expected_existing_monitor_id
+                        or existing_monitor is None
+                        or existing_monitor.config_generation != expected_existing_config_generation
+                    ):
+                        raise MonitorUpdateConflict("monitor changed before restart")
+                if existing:
+                    if not replace_existing:
+                        raise MonitorUpdateConflict("session already has an automation")
+                    existing_monitor = existing.monitor
+                    if existing_monitor is not None and existing_monitor.wake_in_flight:
+                        raise MonitorUpdateConflict(
+                            "existing monitor cannot be replaced while a wake is in flight"
+                        )
+                due = created + cadence
+                monitor = MonitorState(
+                    kind=kind,
+                    target=target,
+                    objective=objective,
+                    created_ts=created,
+                    budgets=budgets,
+                    cadence_secs=cadence,
+                    wake_instructions=wake_instructions,
+                    next_probe_at=due,
+                )
+                loop = NudgeLoop(
+                    id=uuid.uuid4().hex[:8],
+                    slot_key=slot_key,
+                    message="",
+                    idle_secs=cadence,
+                    created_ts=created,
+                    next_due_ts=due,
+                    monitor=monitor,
+                )
+                replacement_payload = {
+                    "version": _STORE_VERSION,
+                    "loops": [
+                        self._serialize_loop(candidate)
+                        for candidate in self._loops.values()
+                        if existing is None or candidate.id != existing.id
+                    ]
+                    + [self._serialize_loop(loop)],
+                }
+                await self._write_monitor_snapshot_locked(replacement_payload)
+                if existing is not None:
+                    self.remove_sync(existing.id, persist=False)
+                self._loops[loop.id] = loop
+                if self._on_monitor_tick is not None:
+                    self._arm_from_deadline(loop)
+        self._emit("added", loop)
+        return loop
+
     async def _add_locked(
         self,
         slot_key: str,
@@ -897,6 +1086,7 @@ class AutoNudgeService:
         stop_sentinel_path: str,
         max_runtime_secs: int = 0,
         admission_check: Callable[[], bool] | None = None,
+        replace_existing: bool = True,
     ) -> NudgeLoop:
         async with _maintenance_lock(self._base_dir):
             return await self._add_unserialized(
@@ -907,6 +1097,7 @@ class AutoNudgeService:
                 stop_sentinel_path=stop_sentinel_path,
                 max_runtime_secs=max_runtime_secs,
                 admission_check=admission_check,
+                replace_existing=replace_existing,
             )
 
     async def _add_unserialized(
@@ -919,6 +1110,7 @@ class AutoNudgeService:
         stop_sentinel_path: str,
         max_runtime_secs: int = 0,
         admission_check: Callable[[], bool] | None = None,
+        replace_existing: bool = True,
     ) -> NudgeLoop:
         idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
         async with self._lock:
@@ -929,6 +1121,13 @@ class AutoNudgeService:
             # removal+add atomically, avoiding a duplicate blocking save here.
             existing = self._find_by_slot(slot_key)
             if existing:
+                if not replace_existing:
+                    raise MonitorUpdateConflict("session already has an automation")
+                existing_monitor = existing.monitor
+                if existing_monitor is not None and existing_monitor.wake_in_flight:
+                    raise MonitorUpdateConflict(
+                        "existing monitor cannot be replaced while a wake is in flight"
+                    )
                 self.remove_sync(existing.id, persist=False, emit=False)
             now = time.time()
             loop = NudgeLoop(
@@ -1119,6 +1318,11 @@ class AutoNudgeService:
             loop = self._loops.get(loop_id)
             if not loop:
                 return None
+            if loop.monitor is not None:
+                # Generic update owns only legacy prompt loops. Reject before
+                # touching even one shared scheduling field so a non-HTTP
+                # caller cannot bypass structured policy.
+                return loop
             # Keep typed nested values intact. ``asdict`` recursively converts
             # MonitorState to a plain dict, which is not a valid rollback value.
             previous = {item.name: getattr(loop, item.name) for item in fields(loop)}
@@ -1290,12 +1494,15 @@ class AutoNudgeService:
             lock.release()
 
     async def remove_by_slot(self, slot_key: str) -> NudgeLoop | None:
-        """Remove the current slot generation inside one maintenance transaction."""
+        """Retire the current slot generation inside one maintenance transaction."""
         async with _maintenance_lock(self._base_dir):
             loop = self._find_by_slot(slot_key)
             if loop is None:
                 return None
-            await self._remove_unserialized(loop.id)
+            if loop.monitor is not None:
+                await self.retire_monitor_for_session_close(loop.id)
+            else:
+                await self._remove_unserialized(loop.id)
             return loop
 
     async def _remove_unserialized(self, loop_id: str) -> None:
@@ -1366,6 +1573,304 @@ class AutoNudgeService:
     def list_all(self) -> list[NudgeLoop]:
         return list(self._loops.values())
 
+    def _monitor_snapshot_with_replacement(
+        self,
+        loop: NudgeLoop,
+        replacement: NudgeLoop,
+    ) -> dict:
+        """Serialize one staged monitor replacement without changing live state."""
+        return {
+            "version": _STORE_VERSION,
+            "loops": [
+                self._serialize_loop(replacement if candidate.id == loop.id else candidate)
+                for candidate in self._loops.values()
+            ],
+        }
+
+    def _apply_staged_monitor(self, loop: NudgeLoop, staged: NudgeLoop) -> None:
+        """Publish a durable staged transition while preserving live object identity."""
+        state = loop.monitor
+        staged_state = staged.monitor
+        if state is None or staged_state is None:
+            raise ValueError("structured monitor replacement requires monitor state")
+        for loop_field in fields(NudgeLoop):
+            if loop_field.name != "monitor":
+                setattr(loop, loop_field.name, deepcopy(getattr(staged, loop_field.name)))
+        for state_field in fields(MonitorState):
+            setattr(
+                state,
+                state_field.name,
+                deepcopy(getattr(staged_state, state_field.name)),
+            )
+
+    async def _persist_staged_monitor_locked(
+        self,
+        loop: NudgeLoop,
+        staged: NudgeLoop,
+    ) -> None:
+        """Persist a complete replacement before publishing it to live readers."""
+        payload = self._monitor_snapshot_with_replacement(loop, staged)
+        try:
+            await self._write_monitor_snapshot_locked(payload)
+        except asyncio.CancelledError:
+            # The snapshot writer propagates cancellation only after draining
+            # the executor write. Publish the state that is already durable
+            # before preserving the caller's cancellation.
+            self._apply_staged_monitor(loop, staged)
+            raise
+        self._apply_staged_monitor(loop, staged)
+
+    async def apply_monitor_probe(
+        self,
+        monitor_id: str,
+        result: GitHubPullRequestProbeResult,
+        *,
+        now: float,
+        config_generation: int,
+    ) -> MonitorDecision:
+        """Persist one probe decision and any wake claim as one transition."""
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if loop is None or state is None or not loop.active or state.outcome is not None:
+                return MonitorDecision.STOP_BLOCKED
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            if state.config_generation != config_generation:
+                self._set_monitor_deadline(staged, now + staged_state.cadence_secs)
+                decision = MonitorDecision.NO_CHANGE
+            elif state.wake_in_flight:
+                return MonitorDecision.NO_CHANGE
+            else:
+                decision = decide_monitor(staged_state, result.observation, now=now)
+                staged_state.probe_count += 1
+                staged_state.last_probe_at = now
+                staged_state.last_decision = decision
+                observation = result.observation
+                if observation.status is MonitorObservationStatus.PROVIDER_ERROR:
+                    staged_state.provider_error_count += 1
+                    staged_state.consecutive_provider_errors += 1
+                    staged_state.last_provider_error = observation.provider_error
+                else:
+                    staged_state.last_observation = deepcopy(result.canonical)
+                    staged_state.last_fingerprint = observation.fingerprint
+                    staged_state.last_observed_at = now
+                    staged_state.consecutive_provider_errors = 0
+                    staged_state.last_provider_error = None
+
+                if decision in {MonitorDecision.NO_CHANGE, MonitorDecision.RECORD_ONLY}:
+                    self._set_monitor_deadline(staged, now + staged_state.cadence_secs)
+                elif decision is MonitorDecision.RETRY_PROVIDER:
+                    shift = max(0, staged_state.consecutive_provider_errors - 1)
+                    retry = min(
+                        _MONITOR_RETRY_MAX_BACKOFF_SECS,
+                        _MONITOR_RETRY_BACKOFF_SECS * (2 ** min(shift, _REARM_BACKOFF_MAX_SHIFT)),
+                        staged_state.cadence_secs,
+                    )
+                    self._set_monitor_deadline(staged, now + retry)
+                elif decision is MonitorDecision.WAKE_ACTIONABLE:
+                    staged_state.last_wake_fingerprint = observation.fingerprint
+                    staged_state.last_wake_reason_code = observation.reason_code
+                    staged_state.wake_in_flight = True
+                    staged_state.wake_delivery = None
+                    self._set_monitor_deadline(staged, 0.0)
+                elif decision is MonitorDecision.STOP_BUDGET:
+                    reason = monitor_budget_reason(staged_state, now=now)
+                    self._apply_monitor_budget_stop(staged, reason, stopped_at=now)
+                else:
+                    staged.active = False
+                    self._set_monitor_deadline(staged, 0.0)
+                    staged_state.outcome = (
+                        MonitorOutcome.SUCCESS
+                        if decision is MonitorDecision.STOP_SUCCESS
+                        else MonitorOutcome.BLOCKED
+                    )
+                    staged_state.stopped_reason = observation.reason_code or "monitor_blocked"
+                    staged_state.stopped_at = now
+            await self._persist_staged_monitor_locked(loop, staged)
+            if not loop.active:
+                self._cancel_timer(loop.id)
+        self._emit("updated", loop)
+        return decision
+
+    def _set_monitor_deadline(self, loop: NudgeLoop, deadline: float) -> None:
+        """Write the scheduler authority and inspection mirror together."""
+        loop.next_due_ts = deadline
+        if loop.monitor is not None:
+            loop.monitor.next_probe_at = deadline
+
+    async def stop_monitor(self, monitor_id: str, *, now: float | None = None) -> NudgeLoop | None:
+        """Retain a structured record with a durable user-stop outcome."""
+        stopped_at = time.time() if now is None else now
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if loop is None or state is None:
+                return None
+            if state.outcome is not None:
+                return loop
+            stopped = deepcopy(loop)
+            self._apply_monitor_user_stop(stopped, stopped_at=stopped_at)
+            # Keep the live state and timer untouched until the terminal
+            # snapshot is durable. A failed write must leave memory matching
+            # the still-active record on disk so restart cannot resurrect work
+            # the current process already considers stopped.
+            await self._persist_staged_monitor_locked(loop, stopped)
+            self._cancel_timer(loop.id)
+        self._emit("updated", loop)
+        return loop
+
+    async def retire_monitor_for_session_close(
+        self, monitor_id: str, *, now: float | None = None
+    ) -> NudgeLoop | None:
+        """Retain a terminal session-close record while disarming its timer."""
+        stopped_at = time.time() if now is None else now
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if loop is None or state is None:
+                return None
+            if state.outcome is not None:
+                return loop
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            staged.active = False
+            # Closing a slot is transactional with history persistence. Keep a
+            # dispatched claim intact so a failed close can restore the exact
+            # completion-evidence deadline instead of losing the only callback
+            # that can account for the accepted action turn.
+            staged_state.outcome = MonitorOutcome.SESSION_CLOSE
+            staged_state.stopped_reason = MONITOR_STOP_SESSION_CLOSE
+            staged_state.stopped_at = stopped_at
+            self._set_monitor_deadline(staged, 0.0)
+            await self._persist_staged_monitor_locked(loop, staged)
+            self._cancel_timer(loop.id)
+        self._emit("updated", loop)
+        return loop
+
+    async def restore_monitor_after_failed_session_close(
+        self,
+        monitor_id: str,
+        *,
+        now: float | None = None,
+        admission_check: Callable[[], bool] | None = None,
+    ) -> NudgeLoop | None:
+        """Rollback only the close-owned terminal transition after close failure."""
+        restored_at = time.time() if now is None else now
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if loop is None or state is None or state.outcome is not MonitorOutcome.SESSION_CLOSE:
+                return None
+            if admission_check is not None and not admission_check():
+                return None
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            staged.active = True
+            staged_state.outcome = None
+            staged_state.stopped_reason = ""
+            staged_state.stopped_at = 0.0
+            if (
+                staged_state.wake_in_flight
+                and staged_state.wake_delivery is MonitorDispatchResult.DISPATCHED
+                and staged_state.completion_evidence_deadline > 0
+            ):
+                deadline = staged_state.completion_evidence_deadline
+            elif staged_state.wake_in_flight:
+                deadline = restored_at + min(
+                    MONITOR_BUSY_RETRY_SECS,
+                    staged_state.cadence_secs,
+                )
+            else:
+                deadline = restored_at + staged_state.cadence_secs
+            self._set_monitor_deadline(staged, deadline)
+            await self._persist_staged_monitor_locked(loop, staged)
+            if self._on_monitor_tick is not None:
+                self._arm_from_deadline(loop)
+        self._emit("updated", loop)
+        return loop
+
+    async def update_monitor(
+        self,
+        monitor_id: str,
+        *,
+        target: str | None = None,
+        objective: str | None = None,
+        cadence_secs: int | None = None,
+        budgets: MonitorBudgets | None = None,
+        budget_patch: dict[str, int] | None = None,
+        wake_instructions: str | None = None,
+    ) -> NudgeLoop | None:
+        """Patch an active structured record without implicit revival."""
+        if budgets is not None and budget_patch is not None:
+            raise ValueError("budgets and budget_patch are mutually exclusive")
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if loop is None or state is None or state.outcome is not None:
+                return None
+            reset_baseline = (target is not None and target != state.target) or (
+                objective is not None and objective != state.objective
+            )
+            if reset_baseline and state.wake_in_flight:
+                raise MonitorUpdateConflict(
+                    "target or objective cannot change while a wake is in flight"
+                )
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            if target is not None:
+                staged_state.target = target
+            if objective is not None:
+                staged_state.objective = objective
+            if cadence_secs is not None:
+                cadence = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(cadence_secs)))
+                staged_state.cadence_secs = cadence
+                staged.idle_secs = cadence
+                if staged.active and not staged_state.wake_in_flight and staged.next_due_ts > 0:
+                    self._set_monitor_deadline(staged, time.time() + cadence)
+            if budget_patch is not None:
+                budget_fields = {
+                    "max_runtime_secs",
+                    "max_agent_turns",
+                    "max_tokens",
+                    "max_provider_errors",
+                }
+                unknown = set(budget_patch) - budget_fields
+                if unknown:
+                    raise ValueError(
+                        "unknown structured monitor budget fields: " + ", ".join(sorted(unknown))
+                    )
+                values = {field: getattr(staged_state.budgets, field) for field in budget_fields}
+                values.update(budget_patch)
+                staged_state.budgets = MonitorBudgets(**values)
+            elif budgets is not None:
+                staged_state.budgets = budgets
+            if wake_instructions is not None:
+                staged_state.wake_instructions = wake_instructions
+            if reset_baseline:
+                staged_state.config_generation += 1
+                staged_state.last_observation = {}
+                staged_state.last_fingerprint = ""
+                staged_state.last_observed_at = 0.0
+                staged_state.last_decision = None
+                staged_state.last_wake_fingerprint = ""
+                staged_state.last_wake_reason_code = ""
+                staged_state.wake_in_flight = False
+                staged_state.wake_delivery = None
+                staged_state.completion_evidence_deadline = 0.0
+                staged_state.last_completion_fingerprint = ""
+                staged_state.consecutive_provider_errors = 0
+                staged_state.last_provider_error = None
+            await self._persist_staged_monitor_locked(loop, staged)
+            if loop.active and not state.wake_in_flight and loop.id not in self._firing:
+                self._arm_from_deadline(loop)
+        self._emit("updated", loop)
+        return loop
+
     async def mark_monitor_action_in_flight(
         self,
         monitor_id: str,
@@ -1397,14 +1902,20 @@ class AutoNudgeService:
                 or state.last_wake_fingerprint == fingerprint
             ):
                 return False
-            reason = monitor_budget_reason(state, now=checked_at)
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            reason = monitor_budget_reason(staged_state, now=checked_at)
             if reason:
-                self._stop_monitor_for_budget(loop, reason, stopped_at=checked_at)
+                self._apply_monitor_budget_stop(staged, reason, stopped_at=checked_at)
             else:
-                state.last_wake_fingerprint = fingerprint
-                state.wake_in_flight = True
+                staged_state.last_wake_fingerprint = fingerprint
+                staged_state.wake_in_flight = True
+                staged_state.wake_delivery = None
                 dispatched = True
-            await self._write_monitor_snapshot_locked()
+            await self._persist_staged_monitor_locked(loop, staged)
+            if not loop.active:
+                self._cancel_timer(loop.id)
         self._emit("updated", loop)
         return dispatched
 
@@ -1423,60 +1934,101 @@ class AutoNudgeService:
                 or state.last_wake_fingerprint != completion.fingerprint
             ):
                 return
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
             disposition = (
                 MonitorActionDisposition.APPROVAL_STALL
-                if loop.approval_stalled
+                if staged.approval_stalled
                 else completion.disposition
             )
-            state.wake_in_flight = False
-            state.last_completion_fingerprint = completion.fingerprint
-            state.last_completion_disposition = disposition
-            state.last_completed_at = completion.completed_ts
-            state.agent_turns += 1
+            if staged_state.wake_delivery is not MonitorDispatchResult.DISPATCHED:
+                staged_state.wake_count += 1
+            staged_state.wake_in_flight = False
+            staged_state.completion_evidence_deadline = 0.0
+            staged_state.last_completion_fingerprint = completion.fingerprint
+            staged_state.last_completion_disposition = disposition
+            staged_state.last_completed_at = completion.completed_ts
+            staged_state.agent_turns += 1
             if completion.input_tokens is None or completion.output_tokens is None:
-                state.token_usage_known = False
+                staged_state.token_usage_known = False
             if completion.input_tokens is not None:
-                state.input_tokens += completion.input_tokens
+                staged_state.input_tokens += completion.input_tokens
             if completion.output_tokens is not None:
-                state.output_tokens += completion.output_tokens
-            reason = monitor_budget_reason(state, now=completion.completed_ts)
-            if reason and state.outcome is None:
-                self._stop_monitor_for_budget(
-                    loop,
+                staged_state.output_tokens += completion.output_tokens
+            reason = monitor_budget_reason(staged_state, now=completion.completed_ts)
+            if reason and staged_state.outcome is None:
+                self._apply_monitor_budget_stop(
+                    staged,
                     reason,
                     stopped_at=completion.completed_ts,
                 )
-            elif disposition is MonitorActionDisposition.APPROVAL_STALL and state.outcome is None:
-                loop.active = False
-                loop.next_due_ts = 0.0
-                state.outcome = MonitorOutcome.BLOCKED
-                state.stopped_reason = MONITOR_STOP_APPROVAL_STALL
-                state.stopped_at = completion.completed_ts
+            elif (
+                disposition is MonitorActionDisposition.APPROVAL_STALL
+                and staged_state.outcome is None
+            ):
+                staged.active = False
+                self._set_monitor_deadline(staged, 0.0)
+                staged_state.outcome = MonitorOutcome.BLOCKED
+                staged_state.stopped_reason = MONITOR_STOP_APPROVAL_STALL
+                staged_state.stopped_at = completion.completed_ts
+            elif staged.active and staged_state.outcome is None:
+                self._set_monitor_deadline(
+                    staged,
+                    completion.completed_ts + staged_state.cadence_secs,
+                )
+            await self._persist_staged_monitor_locked(loop, staged)
+            if not loop.active:
                 self._cancel_timer(loop.id)
-            await self._write_monitor_snapshot_locked()
+            if loop.active and state.outcome is None:
+                if loop.id in self._firing:
+                    self._rearm_pending.add(loop.id)
+                else:
+                    self._arm_from_deadline(loop)
         self._emit("updated", loop)
 
-    def _stop_monitor_for_budget(
+    def _apply_monitor_budget_stop(
         self,
         loop: NudgeLoop,
         reason: str,
         *,
         stopped_at: float,
     ) -> None:
-        """Apply one structured-monitor budget stop under ``_lock``."""
+        """Apply budget-stop fields without changing the live timer registry."""
         state = loop.monitor
         if state is None:
             return
         loop.active = False
-        loop.next_due_ts = 0.0
+        state.wake_in_flight = False
+        state.wake_delivery = None
+        state.completion_evidence_deadline = 0.0
+        self._set_monitor_deadline(loop, 0.0)
         state.outcome = MonitorOutcome.BUDGET
         state.stopped_reason = reason
         state.stopped_at = stopped_at
-        self._cancel_timer(loop.id)
 
-    async def _write_monitor_snapshot_locked(self) -> None:
+    def _apply_monitor_user_stop(self, loop: NudgeLoop, *, stopped_at: float) -> None:
+        """Apply a user stop after its replacement snapshot is durable."""
+        state = loop.monitor
+        if state is None:
+            return
+        loop.active = False
+        # A stop directive can be consumed by the action turn before that
+        # same stream emits its authoritative completion. Keep the claim and
+        # delivery marker long enough for the correlated callback to charge
+        # exactly once; a stop outside an action clears stale delivery data.
+        if not state.wake_in_flight:
+            state.wake_delivery = None
+        state.completion_evidence_deadline = 0.0
+        state.outcome = MonitorOutcome.USER_STOP
+        state.stopped_reason = MONITOR_STOP_USER
+        state.stopped_at = stopped_at
+        self._set_monitor_deadline(loop, 0.0)
+
+    async def _write_monitor_snapshot_locked(self, payload: dict | None = None) -> None:
         """Persist a monitor transition without releasing ``_lock`` mid-write."""
-        payload = self._serialize_state()
+        if payload is None:
+            payload = self._serialize_state()
         future = asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
         try:
             await asyncio.shield(future)
@@ -1491,21 +2043,165 @@ class AutoNudgeService:
         self,
         monitor_id: str,
         fingerprint: str,
+        *,
+        now: float | None = None,
     ) -> None:
-        """Release an unstarted dispatch claim without charging its budget."""
+        """Retire an acknowledged wake when its session cannot accept it."""
         async with self._lock:
             loop = self._loops.get(monitor_id)
             state = loop.monitor if loop is not None else None
             if (
                 loop is None
                 or state is None
+                or state.outcome is not None
                 or not state.wake_in_flight
                 or state.last_wake_fingerprint != fingerprint
             ):
                 return
-            state.wake_in_flight = False
-            state.last_wake_fingerprint = ""
-            await self._write_monitor_snapshot_locked()
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            staged_state.wake_in_flight = False
+            staged_state.completion_evidence_deadline = 0.0
+            staged_state.wake_delivery = MonitorDispatchResult.UNAVAILABLE
+            staged.active = False
+            staged_state.outcome = MonitorOutcome.TARGET_UNAVAILABLE
+            staged_state.stopped_reason = MONITOR_STOP_SESSION_UNAVAILABLE
+            staged_state.stopped_at = time.time() if now is None else now
+            self._set_monitor_deadline(staged, 0.0)
+            await self._persist_staged_monitor_locked(loop, staged)
+            self._cancel_timer(loop.id)
+        self._emit("updated", loop)
+
+    async def monitor_dispatch_is_authorized(
+        self,
+        monitor_id: str,
+        fingerprint: str,
+    ) -> bool:
+        """Revalidate a persisted claim immediately before transport handoff."""
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            return bool(
+                loop is not None
+                and state is not None
+                and loop.active
+                and state.outcome is None
+                and state.wake_in_flight
+                and state.last_wake_fingerprint == fingerprint
+                and state.wake_delivery is not MonitorDispatchResult.DISPATCHED
+            )
+
+    async def record_monitor_dispatch_busy(
+        self,
+        monitor_id: str,
+        fingerprint: str,
+        *,
+        now: float,
+    ) -> None:
+        """Retry one claimed wake after ordinary session concurrency clears."""
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if (
+                loop is None
+                or state is None
+                or not loop.active
+                or not state.wake_in_flight
+                or state.last_wake_fingerprint != fingerprint
+            ):
+                return
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            reason = monitor_budget_reason(staged_state, now=now)
+            if reason:
+                self._apply_monitor_budget_stop(staged, reason, stopped_at=now)
+            else:
+                staged_state.wake_delivery = MonitorDispatchResult.BUSY
+                staged_state.completion_evidence_deadline = 0.0
+                self._set_monitor_deadline(
+                    staged,
+                    now + min(MONITOR_BUSY_RETRY_SECS, staged_state.cadence_secs),
+                )
+            await self._persist_staged_monitor_locked(loop, staged)
+            if not loop.active:
+                self._cancel_timer(loop.id)
+            if loop.active:
+                if loop.id in self._firing:
+                    self._rearm_pending.add(loop.id)
+                else:
+                    self._arm_from_deadline(loop)
+        self._emit("updated", loop)
+
+    async def record_monitor_dispatched(
+        self,
+        monitor_id: str,
+        fingerprint: str,
+        *,
+        now: float,
+    ) -> None:
+        """Persist the finite window for authoritative completion evidence."""
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if (
+                loop is None
+                or state is None
+                or not loop.active
+                or not state.wake_in_flight
+                or state.last_wake_fingerprint != fingerprint
+            ):
+                return
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            deadline = now + MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS
+            if staged_state.wake_delivery is not MonitorDispatchResult.DISPATCHED:
+                staged_state.wake_count += 1
+            staged_state.wake_delivery = MonitorDispatchResult.DISPATCHED
+            staged_state.completion_evidence_deadline = deadline
+            self._set_monitor_deadline(staged, deadline)
+            await self._persist_staged_monitor_locked(loop, staged)
+            if loop.id in self._firing:
+                self._rearm_pending.add(loop.id)
+            else:
+                self._arm_from_deadline(loop)
+        self._emit("updated", loop)
+
+    async def record_monitor_completion_evidence_unavailable(
+        self,
+        monitor_id: str,
+        fingerprint: str,
+        *,
+        now: float,
+    ) -> None:
+        """Fail closed when an accepted wake never reports raw completion."""
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if (
+                loop is None
+                or state is None
+                or state.outcome is not None
+                or not state.wake_in_flight
+                or state.last_wake_fingerprint != fingerprint
+                or state.completion_evidence_deadline <= 0
+                or now < state.completion_evidence_deadline
+            ):
+                return
+            staged = deepcopy(loop)
+            staged_state = staged.monitor
+            assert staged_state is not None
+            staged_state.wake_in_flight = False
+            staged_state.completion_evidence_deadline = 0.0
+            staged.active = False
+            staged_state.outcome = MonitorOutcome.BLOCKED
+            staged_state.stopped_reason = MONITOR_STOP_COMPLETION_UNAVAILABLE
+            staged_state.stopped_at = now
+            self._set_monitor_deadline(staged, 0.0)
+            await self._persist_staged_monitor_locked(loop, staged)
+            self._cancel_timer(loop.id)
         self._emit("updated", loop)
 
     def _find_by_slot(self, slot_key: str) -> NudgeLoop | None:
@@ -1667,6 +2363,23 @@ class AutoNudgeService:
         self._cancel_timer(loop.id)
         self._timers[loop.id] = asyncio.create_task(self._timer(loop, delay))
 
+    async def _deactivate_unwired_monitor(self, loop_id: str) -> None:
+        """Retain but disarm a structured record when no controller is wired."""
+        async with self._lock:
+            loop = self._loops.get(loop_id)
+            if loop is None or loop.monitor is None:
+                return
+            staged = deepcopy(loop)
+            staged.active = False
+            assert staged.monitor is not None
+            staged.monitor.wake_in_flight = False
+            staged.monitor.wake_delivery = None
+            staged.monitor.completion_evidence_deadline = 0.0
+            self._set_monitor_deadline(staged, 0.0)
+            await self._persist_staged_monitor_locked(loop, staged)
+            self._cancel_timer(loop.id)
+        self._emit("updated", loop)
+
     def _arm_from_deadline(self, loop: NudgeLoop) -> None:
         """(Re)arm the timer toward the loop's persistent deadline.
 
@@ -1683,15 +2396,13 @@ class AutoNudgeService:
         sending another message. The delay is capped at ``idle_secs`` so a
         clock jump can never park the timer beyond one full interval.
         """
-        if loop.monitor is not None:
-            # A typed monitor needs a pre-delivery decision controller. PR1
-            # persists its substrate only, so any legacy timer is cancelled and
-            # cannot reach _run_fire_cycle before Task4 wires that controller.
-            self._cancel_timer(loop.id)
+        if loop.monitor is not None and loop.monitor.version != MONITOR_STATE_VERSION:
             return
         now = time.time()
         if loop.next_due_ts <= 0:
             loop.next_due_ts = now + loop.idle_secs
+            if loop.monitor is not None:
+                loop.monitor.next_probe_at = loop.next_due_ts
             self._persist_soon()
         remaining = loop.next_due_ts - now
         if remaining <= 0:
@@ -1728,11 +2439,23 @@ class AutoNudgeService:
         if shutdown_event.is_set():
             return
         if loop.monitor is not None:
-            # A timer can predate monitor attachment or a process upgrade. It
-            # must never dispatch a structured record through legacy prompt
-            # delivery, even if it was already sleeping when state changed.
-            if loop.active:
-                await self.update(loop.id, active=False)
+            if not loop.active:
+                return
+            if self._on_monitor_tick is None:
+                # A structured record must never fall through to legacy prompt
+                # delivery when its typed controller is unavailable.
+                await self._deactivate_unwired_monitor(loop.id)
+                return
+            self._firing.add(loop.id)
+            try:
+                await self._on_monitor_tick(loop)
+            except Exception:
+                logger.exception("structured monitor tick failed for %s", loop.id)
+            finally:
+                self._firing.discard(loop.id)
+                self._rearm_pending.discard(loop.id)
+                if loop.active and loop.id in self._loops and loop.next_due_ts > 0:
+                    self._arm_from_deadline(loop)
             return
         # Kill switch: sentinel file present?
         if loop.stop_sentinel_path and Path(loop.stop_sentinel_path).exists():

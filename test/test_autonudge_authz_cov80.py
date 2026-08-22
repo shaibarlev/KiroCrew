@@ -11,18 +11,22 @@ Every test patches ``sel`` so nothing is written to the real security event log.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from kiro_crew import autonudge_authz
+from kiro_crew.autonudge import MonitorUpdateConflict
 from kiro_crew.autonudge_authz import (
     MAX_RUNTIME_SECS_CEILING,
     authorize_and_add_nudge,
     authorize_and_update_nudge,
 )
+from kiro_crew.monitoring.models import MonitorState
 
 pytestmark = pytest.mark.asyncio
 
@@ -42,6 +46,9 @@ class RecordingSvc:
         self._update_error = update_error
         self.added: list[dict] = []
         self.updated: list[dict] = []
+
+    def get_by_slot(self, slot_key: str) -> Any:
+        return self._loop
 
     async def add(self, **kw: Any) -> Any:
         if self._add_error is not None:
@@ -463,6 +470,185 @@ async def test_add_audits_then_reraises_a_service_failure(audits: list[dict]) ->
     outcomes = [a["outcome"] for a in audits]
     assert outcomes == ["invoked", "error"]  # audited BEFORE the attempt, then the failure
     assert "svc.add failed: OSError" in audits[-1]["error"]
+
+
+async def test_add_monitor_returns_conflict_when_a_wake_is_inflight(
+    audits: list[dict],
+) -> None:
+    class ConflictingSvc:
+        async def add_monitor(self, **kw: Any) -> Any:
+            raise MonitorUpdateConflict("existing monitor wake is in flight")
+
+    loop, error, status = await authorize_and_add_nudge(
+        svc=ConflictingSvc(),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        slot_key="chat-1-1",
+        message="watch",
+        source="dashboard",
+        monitor=MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#456",
+            objective="review_ready",
+            created_ts=1_000.0,
+        ),
+    )
+
+    assert loop is None and status == 409
+    assert error == "existing monitor wake is in flight"
+    assert [event["outcome"] for event in audits] == ["invoked", "denied"]
+
+
+async def test_add_monitor_conflict_preserves_existing_legacy_stop_sentinel(
+    audits: list[dict], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rejected structured replacement cannot disable the legacy loop's kill switch."""
+    sentinel = tmp_path / "stop-chat-1-1"
+    sentinel.write_text("stop", encoding="utf-8")
+    monkeypatch.setattr(
+        autonudge_authz,
+        "resolve_stop_sentinel",
+        lambda key, *args, **kwargs: str(sentinel),
+    )
+
+    class ConflictingSvc:
+        async def add_monitor(self, **kw: Any) -> Any:
+            raise MonitorUpdateConflict("existing loop is not a structured monitor")
+
+    loop, error, status = await authorize_and_add_nudge(
+        svc=ConflictingSvc(),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        slot_key="chat-1-1",
+        message="watch",
+        source="dashboard",
+        monitor=MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#456",
+            objective="review_ready",
+            created_ts=1_000.0,
+        ),
+        replace_existing=False,
+    )
+
+    assert loop is None and status == 409
+    assert error == "existing loop is not a structured monitor"
+    assert sentinel.read_text(encoding="utf-8") == "stop"
+
+
+async def test_add_monitor_forwards_conditional_restart_identity(
+    audits: list[dict],
+) -> None:
+    captured: dict[str, Any] = {}
+    expected = SimpleNamespace(id="new-monitor", slot_key="chat-1-1")
+
+    class RecordingMonitorSvc:
+        async def add_monitor(self, **kw: Any) -> Any:
+            captured.update(kw)
+            return expected
+
+    loop, error, status = await authorize_and_add_nudge(
+        svc=RecordingMonitorSvc(),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        slot_key="chat-1-1",
+        message="watch",
+        source="dashboard",
+        monitor=MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#456",
+            objective="review_ready",
+            created_ts=1_000.0,
+        ),
+        expected_existing_monitor_id="old-monitor",
+        expected_existing_config_generation=4,
+    )
+
+    assert loop is expected and error is None and status == 200
+    assert captured["expected_existing_monitor_id"] == "old-monitor"
+    assert captured["expected_existing_config_generation"] == 4
+
+
+async def test_legacy_add_cannot_replace_a_structured_wake_in_flight(
+    audits: list[dict],
+) -> None:
+    monitor = MonitorState(
+        kind="github_pull_request",
+        target="https://github.com/acme/widgets/pull/7",
+        objective="review_ready",
+        created_ts=1_000.0,
+        wake_in_flight=True,
+    )
+    existing = SimpleNamespace(id="mon-1", monitor=monitor)
+    svc = RecordingSvc(loop=existing)
+
+    loop, error, status = await authorize_and_add_nudge(
+        svc=svc,
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        slot_key="chat-1-1",
+        message="legacy replacement",
+        source="dashboard",
+    )
+
+    assert loop is None and status == 409
+    assert error == "existing monitor cannot be replaced while a wake is in flight"
+    assert svc.added == []
+    assert svc.get_by_slot("chat-1-1") is existing
+
+
+async def test_legacy_create_only_reaches_the_service_lock(audits: list[dict]) -> None:
+    svc = RecordingSvc()
+
+    loop, error, status = await authorize_and_add_nudge(
+        svc=svc,
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        slot_key="chat-1-1",
+        message="legacy fallback",
+        source="dashboard",
+        replace_existing=False,
+    )
+
+    assert loop is not None and error is None and status == 200
+    assert svc.added[0]["replace_existing"] is False
+
+
+@pytest.mark.parametrize("operation", ["update", "stop"])
+async def test_monitor_audit_sink_is_resolved_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    loop_thread = threading.get_ident()
+    factory_threads: list[int] = []
+    sink_threads: list[int] = []
+    sink = SimpleNamespace(
+        log_tool_invocation=lambda **kw: sink_threads.append(threading.get_ident())
+    )
+
+    def _sel() -> Any:
+        factory_threads.append(threading.get_ident())
+        return sink
+
+    monkeypatch.setattr(autonudge_authz, "sel", _sel)
+    svc = SimpleNamespace(
+        update_monitor=lambda *args, **kwargs: None,
+        stop_monitor=lambda *args, **kwargs: None,
+    )
+    if operation == "update":
+        svc.update_monitor = AsyncMock(return_value=None)
+        await autonudge_authz.authorize_and_update_monitor(
+            svc=svc,
+            loop_id="mon-1",
+            session_key="chat-1-1",
+            patch={"cadence_secs": 300},
+            source="dashboard",
+        )
+    else:
+        svc.stop_monitor = AsyncMock(return_value=None)
+        await autonudge_authz.authorize_and_stop_monitor(
+            svc=svc,
+            loop_id="mon-1",
+            session_key="chat-1-1",
+            source="dashboard",
+        )
+
+    assert factory_threads and factory_threads[0] != loop_thread
+    assert sink_threads and sink_threads[0] != loop_thread
 
 
 # ── update(): the remaining payload-shape denials ──

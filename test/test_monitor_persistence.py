@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+from unittest.mock import patch
 
 import pytest
 
@@ -96,6 +98,20 @@ def test_structured_monitor_cadence_must_be_a_positive_integer() -> None:
         raise AssertionError(f"cadence_secs={cadence_secs!r} was accepted")
 
 
+def test_wake_count_defaults_to_zero_and_rejects_negative_values() -> None:
+    """Older records load as unused while malformed negative accounting fails closed."""
+    payload = {
+        "kind": "github_pull_request",
+        "target": "owner/repo#123",
+        "objective": "review_ready",
+        "created_ts": 1_000.0,
+    }
+
+    assert monitor_state_from_dict(payload).wake_count == 0
+    with pytest.raises(ValueError, match="wake_count"):
+        MonitorState(**payload, wake_count=-1)
+
+
 @pytest.mark.parametrize(
     ("payload", "field_name"),
     [
@@ -137,6 +153,7 @@ def test_monitor_state_survives_store_round_trip(tmp_path) -> None:
         last_fingerprint="failure-a",
         last_observed_at=1_200.0,
         last_wake_fingerprint="failure-a",
+        wake_count=3,
         agent_turns=2,
         input_tokens=12_000,
         output_tokens=3_000,
@@ -171,6 +188,7 @@ def test_monitor_state_survives_store_round_trip(tmp_path) -> None:
     assert restored.last_observation == {"head_revision": "abc123", "checks": "failing"}
     assert restored.last_fingerprint == "failure-a"
     assert restored.last_wake_fingerprint == "failure-a"
+    assert restored.wake_count == 3
     assert restored.budgets == MonitorBudgets(
         max_runtime_secs=7_200,
         max_agent_turns=4,
@@ -190,20 +208,13 @@ def test_monitor_state_survives_store_round_trip(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_loop_update_restores_typed_monitor_state(tmp_path, monkeypatch) -> None:
-    """A failed registry write must leave the live typed record unchanged."""
-    monitor = MonitorState(
-        kind="github_pull_request",
-        target="owner/repo#123",
-        objective="review_ready",
-        created_ts=1_000.0,
-    )
+async def test_failed_legacy_loop_update_restores_live_state(tmp_path, monkeypatch) -> None:
+    """A failed registry write must leave the live legacy record unchanged."""
     loop = NudgeLoop(
         id="monitor-update-failure",
         slot_key="chat-1-123",
         message="inspect the pull request",
         next_due_ts=1_500.0,
-        monitor=monitor,
     )
     service = AutoNudgeService(base_dir=tmp_path)
     service._loops[loop.id] = loop
@@ -218,7 +229,6 @@ async def test_failed_loop_update_restores_typed_monitor_state(tmp_path, monkeyp
 
     assert loop.active
     assert loop.next_due_ts == 1_500.0
-    assert loop.monitor is monitor
 
 
 def test_unknown_monitor_version_is_inspectable_and_inert_without_losing_active_intent(
@@ -272,6 +282,31 @@ def test_unknown_monitor_version_is_inspectable_and_inert_without_losing_active_
     assert serialized_loop["active"] is True
     serialized_monitor = serialized_loop["monitor"]
     assert serialized_monitor == future_monitor
+
+
+@pytest.mark.asyncio
+async def test_unknown_monitor_version_is_never_armed(tmp_path) -> None:
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = NudgeLoop(
+        id="future03",
+        slot_key="chat-1-123",
+        message="future instructions",
+        idle_secs=300,
+        active=True,
+        next_due_ts=time.time() + 60,
+        monitor=MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#123",
+            objective="review_ready",
+            created_ts=time.time(),
+            version=99,
+        ),
+    )
+
+    with patch.object(service, "_arm_timer") as arm_timer:
+        service._arm_from_deadline(loop)
+
+    arm_timer.assert_not_called()
 
 
 def test_future_monitor_without_current_identity_survives_store_rewrite(tmp_path) -> None:
