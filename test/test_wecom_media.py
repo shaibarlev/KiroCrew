@@ -82,10 +82,13 @@ class TestDecrypt:
             assert decrypt_media(_encrypt(plain, key), key) == plain
 
     def test_the_wrong_key_is_reported_as_a_key_problem(self) -> None:
-        key = os.urandom(32)
+        # Fixed high-entropy-looking vectors keep this assertion deterministic:
+        # CBC has no authentication, so a random wrong key can occasionally
+        # produce bytes that happen to carry valid PKCS#7 padding.
+        key = bytes(range(32))
         blob = _encrypt(b"hello", key)
         with pytest.raises(WeComMediaError, match="wrong aeskey"):
-            decrypt_media(blob, os.urandom(32))
+            decrypt_media(blob, bytes(reversed(range(32))))
 
     def test_a_short_key_is_refused(self) -> None:
         with pytest.raises(WeComMediaError, match="32-byte key"):
