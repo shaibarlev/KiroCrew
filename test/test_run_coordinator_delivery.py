@@ -23,6 +23,7 @@ from kiro_crew.run_coordinator import (
 )
 from kiro_crew.run_coordinator.delivery import DeliveryAttempt, OutboxDeliveryAdapter
 from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.subagent_persistence import create_agent_folder, write_result_chunk
 
 
 class _Clock:
@@ -845,6 +846,26 @@ async def test_digest_held_failed_event_acks_without_legacy_delivered_tombstone(
 
     assert coordinator._outbox[event.event_id].status is DeliveryState.DELIVERED
     assert marked == []
+
+
+@pytest.mark.asyncio
+async def test_digest_held_shadow_fallback_keeps_error_tombstone(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("kiro_crew.subagent_persistence._SUBAGENTS_DIR", tmp_path)
+    info = SubagentInfo(id="legacy-fallback", task="task", done=True)
+    info.error = "coordinator submission failed"
+    create_agent_folder(info.id, task=info.task, parent_session="dashboard:parent")
+    write_result_chunk(info.id, "partial result")
+    manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
+    manager._agents[info.id] = info
+
+    flusher = SubagentInfo(id="flush", task="flush", done=True)
+    flusher._digest_settle_ids = [info.id]
+    flusher._digest_error_tombstone_ids = [info.id]
+    await manager._settle_digest_holds(flusher)
+
+    tombstone = json.loads((tmp_path / info.id / "tombstone.json").read_text(encoding="utf-8"))
+    assert tombstone["cause"] == "error"
+    assert tombstone["outcome"] == "failed"
 
 
 @pytest.mark.asyncio
