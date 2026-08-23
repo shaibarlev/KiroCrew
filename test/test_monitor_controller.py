@@ -498,9 +498,11 @@ async def test_busy_delivery_retry_is_bounded_by_monitor_runtime(tmp_path):
     )
     controller = MonitorController(service, dispatched, provider=provider)
 
-    await controller.tick(loop, now=110.0)
-    await controller.tick(loop, now=125.0)
+    first = await controller.tick(loop, now=110.0)
+    expired = await controller.tick(loop, now=125.0)
 
+    assert first is MonitorDecision.WAKE_ACTIONABLE
+    assert expired is MonitorDecision.STOP_BUDGET
     assert len(provider.previous) == 1
     assert dispatched.await_count == 1
     assert loop.monitor is not None
@@ -755,6 +757,43 @@ async def test_dispatch_persistence_failure_leaves_live_claim_and_timer_unchange
 
 
 @pytest.mark.asyncio
+async def test_budget_stop_persistence_failure_leaves_active_monitor_armed(tmp_path, monkeypatch):
+    """A failed budget snapshot cannot make live state diverge from restart state."""
+    service = AutoNudgeService(base_dir=tmp_path, on_monitor_tick=AsyncMock())
+    loop = await service.add_monitor(
+        slot_key="chat-1",
+        kind="github_pull_request",
+        target="https://github.com/acme/widgets/pull/7",
+        objective="review_ready",
+        cadence_secs=60,
+        budgets=MonitorBudgets(max_runtime_secs=600),
+        now=100.0,
+    )
+    assert loop.monitor is not None
+    deadline_before = loop.next_due_ts
+    persisted_before = service._path.read_bytes()
+    timer_before = service._timers[loop.id]
+
+    async def fail_snapshot(_payload=None):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
+
+    with pytest.raises(OSError, match="disk full"):
+        await service.stop_monitor_if_budget_exhausted(loop.id, now=701.0)
+
+    assert loop.active
+    assert loop.monitor.outcome is None
+    assert loop.monitor.stopped_reason == ""
+    assert loop.next_due_ts == loop.monitor.next_probe_at == deadline_before
+    assert service._path.read_bytes() == persisted_before
+    restored_timer = service._timers[loop.id]
+    assert restored_timer is timer_before
+    assert not restored_timer.done()
+    service.stop()
+
+
+@pytest.mark.asyncio
 async def test_cadence_edits_during_busy_preserve_retry_and_runtime_bound(tmp_path):
     """A large cadence cannot postpone the claimed retry beyond its runtime."""
     dispatched = AsyncMock(return_value=monitor_models.MonitorDispatchResult.BUSY)
@@ -784,8 +823,9 @@ async def test_cadence_edits_during_busy_preserve_retry_and_runtime_bound(tmp_pa
     assert loop.monitor.completion_evidence_deadline == 0.0
     assert service._timers.get(loop.id) is retry_timer
 
-    await controller.tick(loop, now=retry_at)
+    expired = await controller.tick(loop, now=retry_at)
 
+    assert expired is MonitorDecision.STOP_BUDGET
     assert len(provider.previous) == 1
     assert dispatched.await_count == 1
     assert not loop.active

@@ -1517,6 +1517,11 @@ assembles its HTTP application.
 
 `MonitorController` currently accepts only a public GitHub pull request with the
 `review_ready` objective. The typed provider probe runs off the event loop. The
+provider observes pull-request lifecycle, mergeability, review decision,
+unresolved review threads, and check conclusions. Generic issue/pull-request
+comments and advisory review findings that are not represented by those typed
+facts remain outside its completion predicate; a babysit objective that requires
+them uses a finite legacy loop instead of claiming structured readiness.
 controller persists canonical allowlisted facts, fingerprint, dedicated latest
 classification/reason/summary fields, error counters, decision, and next deadline
 before returning. `last_observation` remains the GitHub fact snapshot; it never
@@ -1536,11 +1541,23 @@ completion accounting, missing-evidence retirement, and unwired-controller
 deactivation. Timers are cancelled or re-armed only after the replacement is
 durable, so a failed write leaves both the live record and its existing timer
 unchanged.
+The controller's pre-probe budget stop uses the same replacement-first ordering,
+so a failed terminal write leaves the active record armed and restart-consistent
+instead of resurrecting work the live process considered exhausted.
 Known actionable GitHub facts (failed checks, requested changes, unresolved
 review threads, and merge blockers) take precedence over simultaneous pending or
 unknown facts. For an actionable classification its deduplication fingerprint
 contains the known blockers but excludes unrelated pending/unknown check churn;
 the full allowlisted canonical observation remains available for inspection.
+Before any fresh provider probe or persisted `BUSY` redispatch, the controller
+persists a terminal budget outcome when a positive runtime, completed-turn, or
+reported-token limit is already spent; an exhausted monitor therefore performs
+neither another provider request nor another action attempt. A previously
+accepted `DISPATCHED` wake still waits for its completion evidence or its bounded
+evidence deadline instead of being cancelled by this check. Token enforcement
+uses the usage values the provider reports; the public `token_usage_known` field
+states whether every completed turn supplied them, while runtime and completed-
+turn limits remain hard fallbacks.
 
 A new actionable fingerprint atomically records `last_wake_fingerprint` and
 `wake_in_flight=True` before delivery. Concurrent or restarted ticks cannot
@@ -1623,7 +1640,10 @@ unsupported, refused by authorization, or otherwise not applied records a
 `denied` directive outcome rather than a successful application.
 The same rule covers a structured stop whose authorization or audit-before-stop
 step fails; only an idempotent stop with no structured record is a success.
-`monitor_inspect` alone is a direct read: it requires a
+A create acknowledgement is therefore only pending until the current turn ends; the
+operator may confirm application in the dashboard, while the agent can inspect
+only from a later user/wake turn. `monitor_inspect` alone is a direct read: it
+requires a
 strict authenticated session key and reports unavailable rather than using
 ancestor fallback. Changing target/objective clears comparison, decision, and
 wake baselines and increments the durable configuration generation; a probe result is
@@ -1709,9 +1729,9 @@ After a successful legacy stop, the chat clears that slot's REST snapshot before
 the Redux record, so reopening the editor while WebSocket delivery is unavailable cannot
 revive the stopped loop from cached state.
 The public monitor projection used by list, slot, WebSocket, and authenticated
-`monitor_inspect` reads includes the canonical `last_observation` plus the dedicated
-`last_observation_status` and `last_observation_reason_code`; persistence-only and raw
-provider fields remain excluded.
+`monitor_inspect` reads includes `token_usage_known`, the canonical `last_observation`,
+and the dedicated `last_observation_status` and `last_observation_reason_code`;
+persistence-only and raw provider fields remain excluded.
 The projection reconstructs GitHub facts from fixed root and check-bucket allowlists
 with a deep copy. Unknown persisted keys are omitted, and an incomplete or malformed
 canonical shape projects as an empty observation; non-string enum fields fail
