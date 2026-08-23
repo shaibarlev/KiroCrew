@@ -1086,6 +1086,40 @@ async def test_process_identity_persistence_failure_aborts_before_execution(monk
 
 
 @pytest.mark.asyncio
+async def test_process_identity_mirrors_legacy_state_off_loop(monkeypatch) -> None:
+    sessions = MagicMock()
+    sessions.get_pid.return_value = 4321
+    manager = SubagentManager(
+        sessions=sessions,
+        ctx_builder=MagicMock(),
+        coordinator=MemoryRunCoordinator(),
+    )
+    manager._coordinator_record_process = AsyncMock()
+    info = SubagentInfo(id="run-process-off-loop", task="inspect")
+    event_loop_thread = threading.get_ident()
+    update_threads: list[int] = []
+    monkeypatch.setattr(
+        "kiro_crew.subagent.platform_compat.process_start_time",
+        lambda _pid: "s1",
+    )
+    monkeypatch.setattr(
+        "kiro_crew.subagent.update_state",
+        lambda *_args, **_kwargs: update_threads.append(threading.get_ident()),
+    )
+
+    await manager._record_process_identity(info, "subagent:run-process-off-loop")
+
+    assert update_threads
+    assert update_threads != [event_loop_thread]
+    manager._coordinator_record_process.assert_awaited_once_with(
+        info,
+        4321,
+        "s1",
+        True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_process_identity_requires_an_execution_fence() -> None:
     manager = SubagentManager(
         sessions=MagicMock(),
