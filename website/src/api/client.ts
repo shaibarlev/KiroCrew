@@ -72,6 +72,9 @@ export type McpShareReason = {
 export type MonitorWrite = {
   slot_key?: string
   kind?: 'github_pull_request'
+    | 'gitlab_merge_request'
+    | 'azure_devops_pull_request'
+    | 'bitbucket_pull_request'
   objective?: 'review_ready'
   target?: string
   cadence_secs?: number
@@ -80,6 +83,10 @@ export type MonitorWrite = {
   max_tokens?: number
   max_provider_errors?: number
   wake_instructions?: string
+}
+
+export type MonitorCreate = Required<MonitorWrite> & {
+  replace_terminal_id?: string
 }
 
 export type MonitorResponse = { ok: true; monitor: unknown }
@@ -2493,7 +2500,7 @@ export const api = {
     fetch('/api/monitors').then(j),
   monitorForSlot: (slot: string): Promise<{ enabled: boolean; monitor: unknown | null }> =>
     fetch('/api/monitors/slot/' + encodeURIComponent(slot)).then(j),
-  monitorCreate: (body: Required<MonitorWrite>): Promise<MonitorResponse> =>
+  monitorCreate: (body: MonitorCreate): Promise<MonitorResponse> =>
     post('/api/monitors', body).then(j) as Promise<MonitorResponse>,
   monitorUpdate: (id: string, body: MonitorWrite): Promise<MonitorResponse> =>
     patch('/api/monitors/' + encodeURIComponent(id), body).then(j) as Promise<MonitorResponse>,

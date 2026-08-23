@@ -1515,16 +1515,34 @@ only monitor models at module scope; the pull-request target parser loads when a
 monitor mutation route is actually invoked, not while the disabled gateway
 assembles its HTTP application.
 
-`MonitorController` currently accepts only a public GitHub pull request with the
-`review_ready` objective. The typed provider probe runs off the event loop. The
-provider observes pull-request lifecycle, mergeability, review decision,
-unresolved review threads, and check conclusions. Generic issue/pull-request
-comments and advisory review findings that are not represented by those typed
-facts remain outside its completion predicate; a babysit objective that requires
-them uses a finite legacy loop instead of claiming structured readiness.
-controller persists canonical allowlisted facts, fingerprint, dedicated latest
+`MonitorController` accepts `review_ready` pull requests from public GitHub,
+GitLab.com or an exact configured self-managed GitLab host, Azure DevOps Services
+at `dev.azure.com`, and Bitbucket Cloud at `bitbucket.org`. A kind-keyed provider
+registry selects the adapter; kind/target mismatches fail before provider I/O.
+Azure DevOps Server and Bitbucket Data Center are not supported. The typed
+provider probe runs off the event loop behind one shared four-probe concurrency
+gate. Provider CLI resource limits are installed by the synchronous spawn shim
+after exec, so a threaded gateway never runs Python in a fork child. GitLab
+pipeline reads request only the newest result for the merge request's current
+head revision, so a successful retry supersedes older failed runs. Discussion
+reads consume at most two 100-item pages, and a still-full second page remains
+explicitly incomplete. GitLab's `requested_changes` detailed merge status maps
+to the actionable shared `changes_requested` review decision. Azure optional reviewers
+with no vote do not create a review requirement, while an explicit negative vote
+remains actionable. Bitbucket review readiness considers only participants whose
+role is `REVIEWER`; authors and other participants cannot create a phantom review
+requirement. Async dashboard and MCP mutation paths await the shared, asynchronously
+refreshed GitLab-host snapshot before target normalization; they never read config
+files on the gateway event loop. Azure status/policy labels and Bitbucket build-status
+labels become stable opaque identities before canonicalization, so provider display
+text cannot enter a structured wake. Generic issue/pull-request comments and
+advisory review findings that are not represented by the provider's canonical
+review or check facts remain outside its completion predicate; a babysit
+objective that requires them uses a finite legacy loop instead of claiming
+structured readiness. The controller persists canonical allowlisted facts,
+fingerprint, dedicated latest
 classification/reason/summary fields, error counters, decision, and next deadline
-before returning. `last_observation` remains the GitHub fact snapshot; it never
+before returning. `last_observation` remains the provider-neutral pull-request fact snapshot; it never
 contains the typed fingerprint, status, reason, or summary. A provider error updates
 the dedicated latest fields while retaining the last good canonical facts and
 fingerprint. `NO_CHANGE`, `RECORD_ONLY`,
@@ -1544,7 +1562,7 @@ unchanged.
 The controller's pre-probe budget stop uses the same replacement-first ordering,
 so a failed terminal write leaves the active record armed and restart-consistent
 instead of resurrecting work the live process considered exhausted.
-Known actionable GitHub facts (failed checks, requested changes, unresolved
+Known actionable facts (failed checks or policies, requested changes, unresolved
 review threads, and merge blockers) take precedence over simultaneous pending or
 unknown facts. For an actionable classification its deduplication fingerprint
 contains the known blockers but excludes unrelated pending/unknown check churn;
@@ -1686,16 +1704,21 @@ before accepting `X-Session-Key`, and browser-cookie fallback is forbidden.
 Both the internal-secret decision and a missing or unsupported session binding
 are best-effort SEL audited before the handler returns.
 Creation uses the same positive defaults and bounds as MCP; zero is never
-unlimited. Dashboard creation is create-only under the service lock: if any
-automation already occupies the slot, the API returns 409 without replacing its
-evidence, even when that record was armed after the dashboard's last read.
+unlimited. Dashboard creation is create-only under the service lock unless it
+names the exact terminal monitor being replaced. That terminal replacement is
+conditional on the id and configuration generation read by the request; active,
+missing, and stale records return 409 without replacing their evidence. An
+ordinary create returns 409 if any automation already occupies the slot, even
+when that record was armed after the dashboard's last read.
 Structured creation never resolves or unlinks the legacy loop stop sentinel, so
 a rejected structured replacement cannot disable an existing legacy kill switch.
 Agent-issued `monitor_watch` retains its explicit replacement behavior outside
-an in-flight wake. Restart rejects an unsupported future monitor version with
-the stable `unsupported_monitor_version` code and does not rewrite its exact
-retained raw payload. Restart also conditionally replaces the exact monitor id
-and configuration generation read by the request; a concurrent restart or edit
+an in-flight wake. The dashboard infers the immutable kind from the canonical
+target URL; the backend repeats strict kind/host/path validation on create and
+target update. Restart rejects an unsupported future monitor version with the
+stable `unsupported_monitor_version` code and does not rewrite its exact retained
+raw payload. Restart also conditionally replaces the exact monitor id and
+configuration generation read by the request; a concurrent restart or edit
 returns 409 instead of silently replacing the winner. Structured AutoNudge
 websocket payloads use the owner-only dashboard
 channel; legacy websocket frames keep their existing authenticated-client
@@ -1732,11 +1755,16 @@ The public monitor projection used by list, slot, WebSocket, and authenticated
 `monitor_inspect` reads includes `token_usage_known`, the canonical `last_observation`,
 and the dedicated `last_observation_status` and `last_observation_reason_code`;
 persistence-only and raw provider fields remain excluded.
-The projection reconstructs GitHub facts from fixed root and check-bucket allowlists
-with a deep copy. Unknown persisted keys are omitted, and an incomplete or malformed
-canonical shape projects as an empty observation; non-string enum fields fail
-closed before membership checks and cannot abort a list, WebSocket, or inspect
-response.
+The projection reconstructs provider-neutral pull-request facts from fixed root
+and check-bucket allowlists with a deep copy. Unknown persisted keys are omitted,
+and an incomplete or malformed canonical shape projects as an empty observation;
+non-string enum fields fail closed before membership checks and cannot abort a
+list, WebSocket, or inspect response.
+Each check bucket is limited to 100 identities, each identity is limited to 200
+characters with a stable digest suffix, and source overflow is retained as
+incomplete evidence rather than a false review-ready result.
+An otherwise valid observation whose kind differs from its owning monitor also
+projects empty.
 
 The SPA represents this compatibility boundary as one discriminated
 `AutomationRecord`: `legacy_goal_loop` and `structured_monitor` never share an
@@ -1791,8 +1819,11 @@ than letting an unbounded provider field ride a future wire frame.
 The chat composer exposes structured monitor creation and mutation only through
 the dedicated `/api/monitors` routes. A new pull-request monitor starts from the
 300-second cadence, 14,400-second runtime, eight-turn, 250,000-token, and
-three-provider-error defaults. The form enforces the backend bounds: cadence
-15–86,400 seconds, runtime 1–604,800 seconds, agent turns 1–8, tokens
+three-provider-error defaults. Terminal evidence remains visible with separate
+restart and new-monitor actions. The new-monitor action opens a fresh form and
+submits the retained terminal id, so changing source providers cannot replace a
+concurrent restart or active monitor. The form enforces the backend bounds:
+cadence 15–86,400 seconds, runtime 1–604,800 seconds, agent turns 1–8, tokens
 1–1,000,000, provider errors 1–20, and at most 1,000 wake-instruction characters.
 Each field exposes the same HTML bound and a localized inline error. Updates
 track dirty fields, reconcile untouched values from same-monitor WebSocket
@@ -1802,8 +1833,16 @@ response or legacy editor callback is normalized into Redux only while the selec
 automation is still the exact record captured at mutation start; a newer WebSocket
 record wins, while a disconnected client sees its accepted write immediately. The
 slot REST query is
-invalidated in either case. Its detail renders target, objective, next probe, wake
-instructions,
+invalidated in either case. An update parses and
+dereferences the target only when that field is dirty, so a non-target edit can
+repair an older record whose persisted target is malformed. The URL field names
+all four source providers, accepts explicitly allowlisted self-managed GitLab ports,
+removes copied-link queries/fragments, canonicalizes the common GitHub `/files`,
+GitLab `/diffs`, and Bitbucket `/diff` tabs before submission, distinguishes empty
+and malformed URLs from provider-changing edits, and maps only the backend's
+`gitlab_host_not_allowed` code to localized `dashboard.gitlab_hosts` setup guidance
+that points to `config.json`, without rendering provider response text.
+Its detail renders target, objective, next probe, wake instructions,
 all budgets, latest classification/decision, probe/wake/turn/token/provider-error
 usage, and terminal reason. Terminal records are retained and read-only; Restart
 is their sole action. Detail evidence uses one column at the narrowest supported
