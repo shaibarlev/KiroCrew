@@ -1517,8 +1517,12 @@ assembles its HTTP application.
 
 `MonitorController` currently accepts only a public GitHub pull request with the
 `review_ready` objective. The typed provider probe runs off the event loop. The
-controller persists canonical allowlisted facts, fingerprint, error counters,
-decision, and next deadline before returning. `NO_CHANGE`, `RECORD_ONLY`,
+controller persists canonical allowlisted facts, fingerprint, dedicated latest
+classification/reason/summary fields, error counters, decision, and next deadline
+before returning. `last_observation` remains the GitHub fact snapshot; it never
+contains the typed fingerprint, status, reason, or summary. A provider error updates
+the dedicated latest fields while retaining the last good canonical facts and
+fingerprint. `NO_CHANGE`, `RECORD_ONLY`,
 `RETRY_PROVIDER`, and all terminal decisions dispatch zero agent turns. Retryable
 provider errors use bounded exponential backoff; terminal provider, success,
 blocked, and budget outcomes remain inspectable with stable reason codes.
@@ -1640,6 +1644,11 @@ charges its turn and token usage exactly once. If raw completion never arrives,
 the user-stop outcome remains terminal and inert: it is never re-armed,
 redispatched, or charged from synthetic evidence. Closing a session records
 `session_close`; a close rollback restores only that close-owned transition.
+The dashboard treats websocket monitor frames as authoritative over mutation
+responses, which may arrive after a newer terminal frame. A `removed` frame is
+a slot tombstone handled before payload validation and deletes either automation
+kind from the shared collection, so malformed or stale loop contents cannot
+leave a phantom blocked monitor behind.
 
 The dashboard contract is separate from legacy `/api/autonudge` mutations:
 `GET/POST /api/monitors`, `GET /api/monitors/slot/{slot}`, `PATCH
@@ -1681,6 +1690,115 @@ replace an automation armed by another tab. Other legacy callers retain explicit
 replacement semantics, but no legacy create can replace a structured record
 while its wake is in flight, and the generic service update also fails closed for
 structured records.
+The active chat does not depend on a successful WebSocket handshake to discover
+the one-record invariant. It reads both per-slot REST projections through one
+React Query entry, fails closed on a malformed, conflicting, or failed snapshot,
+and keeps bounded-monitor Start and the legacy-create handoff disabled until both
+reads prove the slot empty. A live automation frame invalidates that slot query
+before its Redux upsert is applied. A removal frame first replaces the cached
+slot snapshot with `null`, then invalidates it and applies the Redux tombstone;
+a failed refresh therefore cannot resurrect the removed record, while an
+in-flight refresh still keeps creation disabled. A live normalized record still
+wins when present; REST supplies cold hydration when WebSocket connect or
+reconnect never completes. Monitor mutations invalidate the same query instead
+of trusting their response body, preserving live-frame precedence while still
+rehydrating the result when no WebSocket is available. The active-slot REST snapshot
+remains query-local: it can render while disconnected, but its record or absence never
+mutates the Redux collection and therefore cannot overwrite or delete a newer live frame.
+After a successful legacy stop, the chat clears that slot's REST snapshot before removing
+the Redux record, so reopening the editor while WebSocket delivery is unavailable cannot
+revive the stopped loop from cached state.
+The public monitor projection used by list, slot, WebSocket, and authenticated
+`monitor_inspect` reads includes the canonical `last_observation` plus the dedicated
+`last_observation_status` and `last_observation_reason_code`; persistence-only and raw
+provider fields remain excluded.
+The projection reconstructs GitHub facts from fixed root and check-bucket allowlists
+with a deep copy. Unknown persisted keys are omitted, and an incomplete or malformed
+canonical shape projects as an empty observation; non-string enum fields fail
+closed before membership checks and cannot abort a list, WebSocket, or inspect
+response.
+
+The SPA represents this compatibility boundary as one discriminated
+`AutomationRecord`: `legacy_goal_loop` and `structured_monitor` never share an
+implicit shape. One pure normalizer accepts both REST loop records and
+`autonudge_state` WebSocket envelopes. A structured marker is never downgraded
+when its version or required fields are invalid; it becomes retained,
+non-actionable blocked state instead. The normalizer consumes the durable
+`wake_count` directly, along with the authoritative probe, completed-turn,
+provider-error, and token counters. It never infers wakes from current delivery
+state.
+
+Redux owns the only mutable automation collection. Initial connection starts the
+legacy and structured list reads together, fences their combined result by
+connection generation, protects each slot changed by a newer live frame or
+tombstone, and folds both through the same normalizer used for live WebSocket
+updates. Overlapping reconnects share the in-flight React Query request for each
+feed and the original request's live-generation watermark. The reconnect marks
+that older response superseded instead of publishing it, then queues one fresh
+authoritative seed as soon as the shared request settles; repeated reconnects
+collapse onto that one queued refresh. A response that may predate time spent
+disconnected therefore cannot persist after reconnection or reinterpret itself
+against a newer tombstone.
+Channel session keys are normalized through the dashboard's filename-safe
+slot-key fold before collection indexing, live-generation tracking, or tombstone
+removal, so `slack:<ts>` state addresses the visible `slack_<ts>` slot. A live
+frame for one slot does not discard unaffected legacy or terminal records from the
+seed. Structured state wins if both responses name one slot.
+Chat detail and sidebar select from that collection, so target, status, activity
+lanes, and terminal retention cannot disagree because two components cached
+different wire records. Slot teardown clears ephemeral conversation state but
+does not evict retained automation evidence; only an authoritative automation
+seed or tombstone removes that record, so resumed history keeps its terminal
+reason and Restart action. The current-version normalizer validates every recognized
+boolean, nullable enum, timestamp, observation, action, outcome, and bounded
+configuration field, including the active-versus-terminal invariant; a malformed
+record degrades to a non-actionable blocked projection. The shared status
+derivation covers `arm_pending`,
+`active`, `backing_off`, `action_running`, `success`, `blocked`,
+`budget_stopped`, and `user_stopped`; only an in-flight dispatched wake animates
+as agent work. That state alone outranks foreground, workflow, and subagent work
+in the sidebar. Scheduled and retained terminal monitors sit below those signals
+and below unread, so passive state cannot hide work or suppress the inbox marker.
+For a non-empty GitHub observation the normalizer validates the exact canonical
+fact categories: blocking review, all four check-name buckets, draft, head revision,
+kind, mergeability, review decision, review-thread completeness, pull-request state,
+target, and unresolved-thread count. It reads classification, reason, and summary
+only from their dedicated adjacent fields, never by interpreting canonical facts as
+a `MonitorObservation` object. Both the root observation and nested checks object
+must have their exact version-1 key sets; an extra key makes the record inert rather
+than letting an unbounded provider field ride a future wire frame.
+
+The chat composer exposes structured monitor creation and mutation only through
+the dedicated `/api/monitors` routes. A new pull-request monitor starts from the
+300-second cadence, 14,400-second runtime, eight-turn, 250,000-token, and
+three-provider-error defaults. The form enforces the backend bounds: cadence
+15–86,400 seconds, runtime 1–604,800 seconds, agent turns 1–8, tokens
+1–1,000,000, provider errors 1–20, and at most 1,000 wake-instruction characters.
+Each field exposes the same HTML bound and a localized inline error. Updates
+track dirty fields, reconcile untouched values from same-monitor WebSocket
+frames, and send only the dirty fields, so a stale form cannot move a fresh
+deadline or overwrite concurrent configuration. A successful structured mutation
+response or legacy editor callback is normalized into Redux only while the selected
+automation is still the exact record captured at mutation start; a newer WebSocket
+record wins, while a disconnected client sees its accepted write immediately. The
+slot REST query is
+invalidated in either case. Its detail renders target, objective, next probe, wake
+instructions,
+all budgets, latest classification/decision, probe/wake/turn/token/provider-error
+usage, and terminal reason. Terminal records are retained and read-only; Restart
+is their sole action. Detail evidence uses one column at the narrowest supported
+composer width and adds its second column only when the popover has enough room, so
+labels and values do not collide on 320-pixel viewports. The legacy goal-loop form
+remains reachable behind an
+explicit costly label and continues to use `/api/autonudge`, including its
+historical `max_cycles = 0` unlimited meaning. Its popover width is viewport-bounded,
+its content scrolls vertically, and its numeric controls stack at the narrowest
+supported width, so the fallback remains usable at 320 pixels.
+Active-slot hydration reads the legacy record from
+`GET /api/autonudge/slot/{slot}` and the structured record from
+`GET /api/monitors/slot/{slot}`. These snapshots remain in React Query and never
+reconcile into the shared Redux collection. A live frame wins whenever present;
+an in-flight, successful, or failed REST read cannot overwrite or delete it.
 
 ### Security Enforcement
 

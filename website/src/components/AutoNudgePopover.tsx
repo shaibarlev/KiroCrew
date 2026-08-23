@@ -23,6 +23,8 @@ interface Props {
   open: boolean
   onOpenChange: (open: boolean) => void
   onChange: (loop: AutoNudgeLoop | null) => void
+  /** Optional compatibility notice supplied by the bounded-monitor surface. */
+  legacyNotice?: string
   /**
    * True when the slot's last turn ended interrupted (the composer is showing
    * Resume). The chip stops pulsing and turns warn-coloured: the loop is still
@@ -34,7 +36,7 @@ interface Props {
 
 const DEFAULT_MSG = `Your north star is in north_star.md, roadmap in roadmap.md, tasks in tasks.md. Pick the single highest-leverage next step toward the goal and execute it. Update tasks.md. Post a blocker ONCE if genuinely stuck. To halt the loop, create {{STOP_FILE}}`
 
-export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, onChange, interrupted = false }: Props) {
+export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, onChange, legacyNotice, interrupted = false }: Props) {
   // `||` (not `??`) is deliberate on the loop tier: it preserves the fallback
   // so a loop with idle_secs/max_cycles of 0 or an empty message still shows
   // the 60 / 0 / default template rather than a bare 0 / "".
@@ -184,7 +186,11 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
           {loop?.active && loop.cycle_count > 0 ? loop.cycle_count : null}
         </button>
       </PopoverTrigger>
-      <PopoverContent side="top" align="start" className="w-[420px] p-4 text-[12px]">
+      <PopoverContent
+        side="top"
+        align="start"
+        className="w-[min(calc(100vw-1rem),26.25rem)] max-h-[min(80vh,42rem)] overflow-y-auto p-4 text-[12px]"
+      >
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2 font-medium text-text">
             <Goal size={14} className={loop?.active ? 'text-accent' : 'text-muted'} />
@@ -195,6 +201,11 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
             <X size={14} />
           </button>
         </div>
+        {legacyNotice ? (
+          <p role="note" className="mb-2 rounded-md border border-warn/30 bg-warn-subtle px-2 py-1.5 text-[11px] text-warn-fg">
+            {legacyNotice}
+          </p>
+        ) : null}
         <p className="text-muted text-[11px] mb-3 leading-relaxed">{i18nT('components.autoNudgePopover.give_the_agent_a_goal_and_it_will_keep_working_t')}</p>
 
         <div className="text-muted text-[11px] mb-1">{i18nT('components.autoNudgePopover.goal_description')}</div>
@@ -207,7 +218,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
           placeholder={i18nT('components.autoNudgePopover.describe_what_you_want_the_agent_to_accomplish')}
         />
 
-        <div className="flex gap-3 mb-3">
+        <div className="flex flex-col gap-3 mb-3 sm:flex-row">
           <div className="flex-1">
             <div className="text-muted text-[11px] mb-1">{i18nT('components.autoNudgePopover.seconds_between_nudges')}</div>
             <input

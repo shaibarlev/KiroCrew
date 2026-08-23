@@ -1648,6 +1648,8 @@ class AutoNudgeService:
                 staged_state.last_probe_at = now
                 staged_state.last_decision = decision
                 observation = result.observation
+                staged_state.last_observation_status = observation.status
+                staged_state.last_observation_reason_code = observation.reason_code
                 if observation.status is MonitorObservationStatus.PROVIDER_ERROR:
                     staged_state.provider_error_count += 1
                     staged_state.consecutive_provider_errors += 1
@@ -1854,6 +1856,8 @@ class AutoNudgeService:
             if reset_baseline:
                 staged_state.config_generation += 1
                 staged_state.last_observation = {}
+                staged_state.last_observation_status = None
+                staged_state.last_observation_reason_code = ""
                 staged_state.last_fingerprint = ""
                 staged_state.last_observed_at = 0.0
                 staged_state.last_decision = None
