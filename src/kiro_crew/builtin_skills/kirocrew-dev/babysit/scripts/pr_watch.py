@@ -61,6 +61,7 @@ import json
 import math
 import re
 import sys
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from kiro_crew.github_runner import resolve_gh, run_gh
@@ -78,6 +79,25 @@ from kiro_crew.irq import (
 _AUDIT_CALLER = "core:babysit-pr-watch"
 
 _GH_TIMEOUT_SECS = 25
+
+#: How far back a conversation signal still counts as new.
+#:
+#: The probe has no memory of its own -- the kernel owns dedupe state and a
+#: probe only returns a Tick -- so it cannot record "these comments already
+#: existed when I was armed". Without a horizon, arming a watch on a PR with
+#: forty comments would report all forty on the first tick. The horizon makes
+#: that impossible while still catching anything that genuinely arrives during
+#: the watch, because a real new comment is always younger than this.
+#:
+#: MUST stay below the kernel's ``realert_secs``: the kernel drops sticky dedupe
+#: keys once they pass that window, and what stops a dropped key from being
+#: re-reported is this filter having aged the signal out first.
+DEFAULT_COMMENT_HORIZON_SECS = 3600.0
+
+#: How many trailing comments / reviews one tick inspects. Chronological
+#: ascending, so the tail is the recent end, and everything before it is older
+#: than any usable horizon.
+_MAX_CONVERSATION_SCAN = 50
 
 #: Failing conclusions/states across CheckRun and StatusContext shapes.
 _FAILING = {"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
@@ -213,6 +233,55 @@ def _run_gh(args: list[str]) -> tuple[int, str]:
         return 1, ""
 
 
+def _age_secs(raw: object) -> float | None:
+    """Seconds since an ISO-8601 GitHub timestamp, or None if unusable.
+
+    Returns None rather than 0 for anything unparseable, and the caller treats
+    None as "cannot tell how old this is" by IGNORING the signal. That is the
+    safe direction here: a signal of unknown age that is assumed fresh would be
+    re-reported on the tick after every dedupe drop, and a watch that cries wolf
+    is turned off. Genuinely new comments always carry a valid timestamp.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        # GitHub spells UTC as a trailing Z, which fromisoformat rejects before
+        # Python 3.11 -- normalize rather than depend on the interpreter version.
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - stamp).total_seconds()
+
+
+def _finite_non_negative(raw: object, label: str) -> float:
+    """Coerce one cron-message number, rejecting every unrepresentable shape.
+
+    ``json.loads`` yields three separately hostile shapes for one numeric field
+    and each kills the cron the same way -- by raising on every tick, which
+    auto-pauses the job, so the watch dies silently from a config typo:
+
+    * ``1e309`` -> ``float('inf')`` -> ``int(inf)`` raises OverflowError
+    * a 401-digit int -> arbitrary-precision int -> ``float()`` raises OverflowError
+    * ``NaN`` -> ``float('nan')`` -> poisons every comparison it reaches
+
+    An unrepresentable number can never become valid, so all of these are
+    terminal (``ValueError`` -> ``Done``) rather than retried.
+    """
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        raise ValueError(f"pr_watch {label} must be a number")
+    try:
+        value = float(raw)
+    except OverflowError as exc:
+        raise ValueError(f"pr_watch {label} is too large to represent") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"pr_watch {label} must be a finite number")
+    if value < 0:
+        raise ValueError(f"pr_watch {label} must not be negative")
+    return value
+
+
 class PrWatchProbe(Probe):
     """Observes one GitHub pull request through ``gh pr view``."""
 
@@ -222,6 +291,7 @@ class PrWatchProbe(Probe):
     wake_on_green: bool
     note: str
     coalesce_secs: float
+    comment_horizon_secs: float
 
     def identity(self, ctx: object) -> tuple[str, str]:
         try:
@@ -251,26 +321,13 @@ class PrWatchProbe(Probe):
         raw_reds = params.get("known_reds")
         if raw_reds is not None and not isinstance(raw_reds, list):
             raise ValueError("pr_watch known_reds must be a list of check names")
-        raw_coalesce = params.get("coalesce_secs", DEFAULT_COALESCE_SECS)
-        if not isinstance(raw_coalesce, (int, float)) or isinstance(raw_coalesce, bool):
-            raise ValueError("pr_watch coalesce_secs must be a number")
-        # Convert INSIDE the guard, because json.loads yields three separately
-        # hostile shapes for one field and each kills the cron the same way --
-        # by raising on every tick, which auto-pauses the job, so the watch dies
-        # silently from a config typo:
-        #   1e309            -> float('inf')            -> int(inf) OverflowError
-        #   <401-digit int>  -> arbitrary-precision int  -> float() OverflowError
-        #   NaN              -> float('nan')             -> poisons comparisons
-        # An unrepresentable number can never become valid, so all three are
-        # terminal rather than retried.
-        try:
-            coalesce = float(raw_coalesce)
-        except OverflowError as exc:
-            raise ValueError("pr_watch coalesce_secs is too large to represent") from exc
-        if not math.isfinite(coalesce):
-            raise ValueError("pr_watch coalesce_secs must be a finite number")
-        if coalesce < 0:
-            raise ValueError("pr_watch coalesce_secs must not be negative")
+        coalesce = _finite_non_negative(
+            params.get("coalesce_secs", DEFAULT_COALESCE_SECS), "coalesce_secs"
+        )
+        horizon = _finite_non_negative(
+            params.get("comment_horizon_secs", DEFAULT_COMMENT_HORIZON_SECS),
+            "comment_horizon_secs",
+        )
 
         self.repo = repo
         self.pr = pr
@@ -278,11 +335,113 @@ class PrWatchProbe(Probe):
         self.wake_on_green = bool(params.get("wake_on_green", True))
         self.note = str(params.get("note") or "")[:500]
         self.coalesce_secs = coalesce
+        self.comment_horizon_secs = horizon
         return ("gh-pr", f"{repo}#{pr}")
 
     def tuning(self) -> dict[str, float]:
         """The window this watch was armed with, from its cron message."""
         return {"coalesce_secs": self.coalesce_secs}
+
+    def _conversation(self, data: dict) -> list[Observation]:
+        """Observations for things said about the PR rather than run on it.
+
+        These carry ``epoch_scoped=False``: a comment belongs to the pull
+        request, not to the commit under review, so it must survive the epoch
+        reset a force-push triggers. Left epoch scoped, pushing a fix five
+        minutes after a reviewer commented would replay that comment.
+
+        The brief names WHO and WHEN and never quotes the body. That boundary is
+        the whole point of the split: the probe is the detector, so it reports
+        that something was said; reading it, judging whether it is a real
+        finding, and deciding what to do are the woken agent's job, done with
+        this session's trust rather than a cron script's.
+        """
+        out: list[Observation] = []
+        horizon = self.comment_horizon_secs
+
+        def fresh(stamp: object) -> bool:
+            age = _age_secs(stamp)
+            return age is not None and age <= horizon
+
+        # Chronological ascending, so the tail is the recent end. Bounded because
+        # a PR that ran twenty review rounds carries hundreds of comments and
+        # every one older than the horizon is discarded anyway.
+        for item in (data.get("comments") or [])[-_MAX_CONVERSATION_SCAN:]:
+            if not isinstance(item, dict):
+                continue
+            # Our OWN disposition comments. Without this the watch is a feedback
+            # loop: the woken agent posts a disposition, the next tick sees a new
+            # comment and wakes it again to read what it just wrote.
+            if item.get("viewerDidAuthor"):
+                continue
+            ident = str(item.get("id") or "")
+            if not ident or not fresh(item.get("createdAt")):
+                continue
+            who = sanitize_label((item.get("author") or {}).get("login")) or "someone"
+            out.append(
+                Observation(
+                    f"comment:{ident}",
+                    Severity.WAKE,
+                    self._brief(
+                        "",
+                        "new comment",
+                        f"{who} commented at {item.get('createdAt')}. A comment "
+                        "moves no check, so nothing else here will tell you it "
+                        "arrived. Read it and reply -- a reviewer verdict can "
+                        "sit in a comment body while its check reports success.",
+                    ),
+                    epoch_scoped=False,
+                )
+            )
+
+        for item in (data.get("reviews") or [])[-_MAX_CONVERSATION_SCAN:]:
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("id") or "")
+            if not ident or not fresh(item.get("submittedAt")):
+                continue
+            who = sanitize_label((item.get("author") or {}).get("login")) or "someone"
+            verdict = sanitize_label(item.get("state")) or "REVIEW"
+            out.append(
+                Observation(
+                    f"review:{ident}",
+                    Severity.WAKE,
+                    self._brief(
+                        "",
+                        "new review",
+                        f"{who} submitted a {verdict} review at "
+                        f"{item.get('submittedAt')}. Read it and disposition "
+                        "every point before calling the PR ready.",
+                    ),
+                    epoch_scoped=False,
+                )
+            )
+
+        # A DECISION rather than an event, so the value IS the dedupe key: it
+        # fires once per distinct decision and stays quiet while it holds.
+        # REVIEW_REQUIRED is the resting state every unreviewed PR sits in and
+        # would wake on arming, so it is not a signal.
+        decision = sanitize_label(data.get("reviewDecision"))
+        if decision in {"CHANGES_REQUESTED", "APPROVED"}:
+            out.append(
+                Observation(
+                    f"review-decision:{decision}",
+                    Severity.WAKE,
+                    self._brief(
+                        "",
+                        f"review decision {decision}",
+                        "The PR's overall review decision changed. "
+                        + (
+                            "A human is blocking: address the request and " "re-request review."
+                            if decision == "CHANGES_REQUESTED"
+                            else "Approved -- report it; merging stays the " "maintainer's call."
+                        ),
+                    ),
+                    epoch_scoped=False,
+                )
+            )
+
+        return out
 
     def observe(self, ctx: object) -> Tick:
         data = self._fetch()
@@ -380,6 +539,14 @@ class PrWatchProbe(Probe):
                 )
             )
 
+        # Appended AFTER the check-derived observations and deliberately outside
+        # the all-green condition above: a comment is not evidence about CI, so
+        # it must neither suppress "review-ready" nor be suppressed by it. It
+        # also contributes nothing to ``pending`` -- a conversation never
+        # "settles", and counting it would hold the coalescing window open until
+        # the hard cap on every talkative PR.
+        observations.extend(self._conversation(data))
+
         return Tick(
             epoch=head,
             observations=observations,
@@ -397,7 +564,8 @@ class PrWatchProbe(Probe):
                 "--repo",
                 self.repo,
                 "--json",
-                "state,mergedAt,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
+                "state,mergedAt,mergeable,mergeStateStatus,headRefOid,"
+                "statusCheckRollup,comments,reviews,reviewDecision",
             ]
         )
         if rc != 0:
@@ -413,8 +581,14 @@ class PrWatchProbe(Probe):
         return data if isinstance(data, dict) else None
 
     def _brief(self, head: str, reason: str, detail: str) -> str:
+        # A conversation signal has no head -- it is about the pull request, not
+        # about a commit -- and passes "" so the parenthetical is dropped rather
+        # than rendered empty.
+        subject = f"{self.repo}#{self.pr}"
+        if head:
+            subject += f" (head {head[:9]})"
         lines = [
-            f"PR watch signal on {self.repo}#{self.pr} (head {head[:9]}): {reason}",
+            f"PR watch signal on {subject}: {reason}",
             detail,
         ]
         if self.note:
