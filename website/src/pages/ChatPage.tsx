@@ -7603,7 +7603,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onClose={() => setVoiceSetupOpen(false)}
               onOpenSettings={() => {
                 setVoiceSetupOpen(false)
-                navigate(embedded ? '/embed/settings' : '/settings?tab=voice')
+                navigate(embedded ? '/embed/settings' : '/settings/voice')
               }}
             />
             {/* Agent dropdown portal — triggered from input bar */}
@@ -7647,7 +7647,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 defaultEffort={defaultEffort}
                 onSetDefault={() => {
                   setModelDropdown(false)
-                  navigate(`/settings?tab=chat&highlight=${SETTINGS_DEFAULT_MODEL_ID}`)
+                  navigate(`/settings/chat?highlight=${SETTINGS_DEFAULT_MODEL_ID}`)
                 }}
                 agentName={_modelPinAgent}
                 pinModelName={_modelPinActive || 'auto'}

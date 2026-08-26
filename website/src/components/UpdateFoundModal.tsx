@@ -265,7 +265,7 @@ export default function UpdateFoundModal() {
 
   const goToAbout = () => {
     dismiss()
-    navigate('/settings?tab=about')
+    navigate('/settings/about')
   }
 
   return (

@@ -3566,7 +3566,7 @@ app.whenReady().then(async () => {
     win.focus();
     const wc = win._mcView.webContents;
     if (wc && !wc.isDestroyed()) {
-      wc.send("navigate", tab ? `/settings?tab=${tab}` : "/settings");
+      wc.send("navigate", tab ? `/settings/${tab}` : "/settings");
     }
   };
   // View > Keep on Top: flip always-on-top on the focused dashboard window,

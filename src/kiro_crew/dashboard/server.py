@@ -2347,7 +2347,7 @@ def _arm_prevent_sleep_poll(state: DashboardState, port: int) -> None:
 # the notification can offer the opt-out at the exact moment the user is being
 # asked to review yet another candidate. Same highlight=key:<configKey> format
 # the frontend's <SettingRef> builds, consumed by useSettingHighlight.
-_SKILL_APPROVAL_SETTING_URL = "/settings?tab=skills&highlight=key:skills.approval_required"
+_SKILL_APPROVAL_SETTING_URL = "/settings/skills?highlight=key:skills.approval_required"
 
 
 def _pending_skill_notification(info: dict) -> tuple[str, str, str, list[dict[str, str]]]:

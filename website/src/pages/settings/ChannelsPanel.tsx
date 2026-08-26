@@ -88,8 +88,11 @@ function govState(
 
 /** Channels tab: SettingsSubNav list-detail over the chat integrations.
  *  Selection is URL-backed (?sub=slack; legacy ?channel= still lands) so deep
- *  links and the legacy ?tab=slack remap keep working. */
-export function ChannelsPanel() {
+ *  links and the legacy ?tab=slack remap keep working. `basePath` opts the
+ *  sub-nav into path navigation instead: the selection becomes the second
+ *  path segment (`${basePath}/channels/slack`) — the Settings host passes it,
+ *  any other mount keeps the query behavior by omitting it. */
+export function ChannelsPanel({ basePath }: { basePath?: string } = {}) {
   const statuses = useQueries({
     queries: CHANNELS.map(c => ({
       queryKey: [c.queryKey],
@@ -156,6 +159,7 @@ export function ChannelsPanel() {
       railWidth={280}
       listLabel={i18nT('pages.settings.channelsPanel.chat_channels')}
       backLabel={i18nT('pages.settings.channelsPanel.channels')}
+      basePath={basePath}
     >
       {active => {
         const selected = CHANNELS.find(c => c.key === active)
