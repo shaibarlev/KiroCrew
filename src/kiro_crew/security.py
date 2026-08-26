@@ -6147,6 +6147,91 @@ _EXTRACT_INTO_TRUST_ROOT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The rule above matches the DESTINATION half only.  Its target is an archive or
+# copy program unpacking INTO the crew data home, but ``-d`` is also ``ls``'s
+# "show the directory entry itself, not its contents" and a debug switch
+# elsewhere, so keying on the bare flag refused read-only listings of the crew
+# home while every other spelling of the same read (``-l``, ``-lt``, grep, a
+# Python ``open``) stayed allowed.  Nothing about reading that directory is
+# protected, so the flag character alone was never the boundary: the PROGRAM is.
+#
+# Do NOT re-broaden this list.  Every name added here turns that program's
+# ``-C``/``-d`` argument into a write destination, and a program that merely
+# ACCEPTS one of those flags for something else re-introduces the false positive
+# this anchor exists to remove.  Keep it to programs whose destination argument
+# unambiguously means "write here", and prefer leaving a rare alias out: an
+# entry also costs a false positive on any crew-home path whose last segment is
+# that exact word.
+#
+# Only the LIVE members below can actually fire today, because the destination
+# half of the rule matches ``-C``/``-d`` and nothing else.  The INERT members
+# spell their destination differently (``7z -o``, ``cpio -D``, ``rsync``'s
+# positional operand), so naming them here does not by itself detect an
+# extraction by those tools -- that would need the destination half to grow, and
+# growing it is a separate change with its own false-positive budget.  They are
+# listed anyway so the program half is already correct if that happens, and
+# ``test_extract_programs_membership_is_pinned`` pins which side each name is on
+# so this comment cannot silently drift.
+_EXTRACT_LIVE_PROGRAMS: tuple[str, ...] = (
+    "tar",  # ``-C`` is the extraction dir
+    "bsdtar",  # the macOS/BSD alias, same flag
+    "gtar",  # the GNU alias, same flag
+    "unzip",  # ``-d`` is the exdir
+)
+#: Named for a future widening of the destination half; see the note above.
+_EXTRACT_INERT_PROGRAMS: tuple[str, ...] = (
+    "7z",  # p7zip writes to ``-o<dir>``
+    "7za",
+    "7zr",
+    "cpio",  # ``-D``/``--directory``
+    "rsync",  # positional destination operand
+)
+_EXTRACT_PROGRAMS: tuple[str, ...] = (
+    _EXTRACT_LIVE_PROGRAMS + _EXTRACT_INERT_PROGRAMS
+)
+_EXTRACT_PROGRAM_ALT = "|".join(re.escape(p) for p in _EXTRACT_PROGRAMS)
+
+# Presence of an archive program ANYWHERE in the command, matched as a WORD.
+#
+# Deliberately position-INDEPENDENT.  An earlier attempt anchored the program to
+# "command position" inside separator-split segments, and that reproduced the
+# very bug this fix is about -- inferring a program from where a substring sits
+# in a raw string.  It let five real extractions through (``'tar' -xf``, a
+# quoted ``sh -c``/``eval`` body, an ``&`` inside a quoted filename splitting the
+# segment, a bare CR separator), because a lexical position cannot see the shell
+# grammar that decides what is actually a command.
+#
+# So this asks the only question the matcher can answer soundly: does an archive
+# program name appear as a word at all?  The boundary is what separates a program
+# from a filename -- a preceding ``.``, ``-``, ``_`` or alphanumeric means the
+# word is part of a longer name (``backup.tar``, ``x.tar.gz``, ``mytar``), while
+# a preceding ``/`` is a path prefix whose final segment IS the program
+# (``/usr/bin/tar``).  A plain ``\b`` gets this wrong in both directions.
+#
+# The trade is one-directional and deliberate: a command that merely MENTIONS an
+# archive program while reading the crew home over-blocks.  That fails CLOSED,
+# which is the correct direction for this gate, and it is a far rarer shape than
+# the read this fix restores.
+_EXTRACT_PROGRAM_RE = re.compile(
+    r"(?<![\w.\-])(?:" + _EXTRACT_PROGRAM_ALT + r")(?:\.exe)?(?![\w.\-])",
+    re.IGNORECASE,
+)
+
+
+def _extracts_into_trust_root(command: str) -> bool:
+    """True when an ARCHIVE program names the crew data home as its destination.
+
+    Requires BOTH halves: the destination-flag match
+    (:data:`_EXTRACT_INTO_TRUST_ROOT_RE`) and an archive program word
+    (:data:`_EXTRACT_PROGRAM_RE`) somewhere in the same command.  A read that
+    names no archive program -- ``ls -d`` on the crew home -- is not an
+    extraction and is no longer refused as one.
+    """
+    if not _EXTRACT_INTO_TRUST_ROOT_RE.search(command):
+        return False
+    return bool(_EXTRACT_PROGRAM_RE.search(command))
+
+
 # ── Symlink-staging to a sensitive target via RELATIVE traversal ──
 # The home-anchored ~/$HOME/absolute forms of ``ln -sf ~/.aws/credentials link``
 # are already caught by _build_sensitive_regex (the sensitive path appears as an
@@ -6259,7 +6344,7 @@ def is_sensitive_bash_command(command: str) -> str | None:
     # ── Pass 1: regex fast-path ──
     if _get_sensitive_re().search(command):
         return "Blocked: command accesses sensitive credential path"
-    if _EXTRACT_INTO_TRUST_ROOT_RE.search(command):
+    if _extracts_into_trust_root(command):
         return "Blocked: command extracts into the governance trust-root directory"
     # Block ANY command referencing a sensitive path via relative traversal,
     # regardless of verb.  The home-anchored/absolute forms are already caught

