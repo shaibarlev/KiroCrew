@@ -8408,11 +8408,14 @@
       "collapsibleToolGroup": {
         "approval_needed": "Se requiere aprobación",
         "approvals_pending": "aprobaciones pendientes",
+        "batch_preview_note": "La más reciente de {{count}} llamadas pendientes; todas se resolverán juntas.",
         "approve": "Aprobar",
+        "approve_all": "Aprobar las {{count}}",
         "approved": "Aprobado",
         "collapse": "Contraer",
         "expand": "Expandir",
         "reject": "Rechazar",
+        "reject_all": "Rechazar las {{count}}",
         "rejected": "Rechazado",
         "resolved": "Resuelto",
         "running": "En ejecución",
@@ -8421,6 +8424,7 @@
         "tool_call_one": "{{count}} llamada a herramienta",
         "tool_call_other": "{{count}} llamadas a herramientas",
         "trust": "Confiar",
+        "trust_all": "Confiar en las {{count}}",
         "trusted": "De confianza",
         "view_full_activity": "Ver toda la actividad →"
       },

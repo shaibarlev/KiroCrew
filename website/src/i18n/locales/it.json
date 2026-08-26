@@ -8408,11 +8408,14 @@
       "collapsibleToolGroup": {
         "approval_needed": "Approvazione necessaria",
         "approvals_pending": "approvazioni in attesa",
+        "batch_preview_note": "La più recente di {{count}} chiamate in attesa; verranno risolte tutte insieme.",
         "approve": "Approva",
+        "approve_all": "Approva tutte ({{count}})",
         "approved": "Approvato",
         "collapse": "Comprimi",
         "expand": "Espandi",
         "reject": "Rifiuta",
+        "reject_all": "Rifiuta tutte ({{count}})",
         "rejected": "Rifiutato",
         "resolved": "Risolto",
         "running": "In esecuzione",
@@ -8421,6 +8424,7 @@
         "tool_call_one": "{{count}} chiamata a strumento",
         "tool_call_other": "{{count}} chiamate a strumenti",
         "trust": "Considera attendibile",
+        "trust_all": "Fidati di tutte ({{count}})",
         "trusted": "Attendibile",
         "view_full_activity": "Visualizza tutta l'attività →"
       },

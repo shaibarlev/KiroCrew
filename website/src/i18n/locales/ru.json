@@ -8527,11 +8527,14 @@
       "collapsibleToolGroup": {
         "approval_needed": "Требуется подтверждение",
         "approvals_pending": "ожидают подтверждения",
+        "batch_preview_note": "Последний из {{count}} ожидающих вызовов; все будут обработаны вместе.",
         "approve": "Разрешить",
+        "approve_all": "Разрешить все ({{count}})",
         "approved": "Разрешено",
         "collapse": "Свернуть",
         "expand": "Развернуть",
         "reject": "Отклонить",
+        "reject_all": "Отклонить все ({{count}})",
         "rejected": "Отклонено",
         "resolved": "Обработано",
         "running": "Выполняется",
@@ -8541,6 +8544,7 @@
         "tool_call_one": "{{count}} вызов инструмента",
         "tool_call_other": "{{count}} вызова инструмента",
         "trust": "Доверять",
+        "trust_all": "Доверять всем ({{count}})",
         "trusted": "Доверено",
         "view_full_activity": "Показать всю активность →"
       },
