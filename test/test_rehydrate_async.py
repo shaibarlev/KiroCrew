@@ -169,3 +169,102 @@ async def test_no_conversation_log_returns_none() -> None:
     state = MagicMock()
     state.conversation_log = None
     assert await cp.rehydrate_slot_from_history_async(state, "chat-1-x") is None
+
+
+# ── The shared prefetch seam (#895) ──
+#
+# The wrapper's read half is now a named module-level function so the two bulk
+# startup restore drivers can hoist the SAME reads into a worker thread instead
+# of each growing its own copy. These tests pin the contract the drivers depend
+# on, which the wrapper's own tests above do not reach: the readability flag, and
+# not paying for a transcript walk that will be thrown away.
+
+
+class _StatusLog(_Log):
+    """``_Log`` plus the ``get_metadata_status`` form the open-tab restore needs."""
+
+    def __init__(self, meta: dict | None, messages: list[dict] | None, readable: bool) -> None:
+        super().__init__(meta, messages)
+        self._readable = readable
+
+    def get_metadata_status(self, key: str) -> tuple[dict, bool]:
+        self.read_threads.append(threading.current_thread().name)
+        return self._meta or {}, self._readable
+
+
+def test_prefetch_reports_an_unreadable_metadata_read() -> None:
+    """``with_status`` must carry the difference ``get_metadata`` cannot express.
+
+    ``{}`` means both "never persisted" and "could not be read after retries",
+    and the open-tab restore does something destructive with the second reading:
+    it drops a live tab. So the flag must survive the trip through the prefetch.
+    """
+    log = _StatusLog({}, [], readable=False)
+    meta, readable, messages, model_map = cp._prefetch_rehydrate_inputs(
+        log, "dashboard:chat-1-x", with_status=True
+    )
+    assert meta == {}
+    assert readable is False
+    assert messages is None, "an unreadable session must not report a transcript"
+    assert model_map is None
+
+
+def test_prefetch_skips_the_transcript_walk_for_an_absent_session() -> None:
+    """No metadata → no transcript read. The walk is the expensive half."""
+    log = _StatusLog({}, [{"role": "user", "content": "hi"}], readable=True)
+    meta, readable, messages, _ = cp._prefetch_rehydrate_inputs(
+        log, "dashboard:chat-1-x", with_status=True
+    )
+    assert (meta, readable, messages) == ({}, True, None)
+    # Only the metadata line was read — one recorded read, not two — even though
+    # the stub has a transcript sitting there ready to hand over.
+    assert len(log.read_threads) == 1
+
+
+def test_prefetch_skips_the_transcript_walk_for_a_closed_session() -> None:
+    """A session closed with ✕ is not rebuilt, so its transcript is dead weight."""
+    log = _Log({"closed": True}, [{"role": "user", "content": "hi"}])
+    _meta, _readable, messages, model_map = cp._prefetch_rehydrate_inputs(
+        log, "dashboard:chat-1-closed"
+    )
+    assert messages is None
+    assert model_map is None
+    # Only the metadata line was read — one recorded read, not two.
+    assert len(log.read_threads) == 1
+
+
+def test_prefetch_adopts_a_closed_session_on_request() -> None:
+    """``adopt_closed`` callers (app-owned worker slots) still get the walk."""
+    log = _Log({"closed": True}, [{"role": "user", "content": "hi"}])
+    _meta, _readable, messages, _ = cp._prefetch_rehydrate_inputs(
+        log, "dashboard:chat-1-closed", adopt_closed=True, kiro_model_map={}
+    )
+    assert messages == [{"role": "user", "content": "hi"}]
+
+
+def test_prefetch_reuses_a_callers_model_map() -> None:
+    """A bulk caller builds the agent→model map once; the prefetch must not re-glob.
+
+    Rebuilding it per slot re-globs and re-parses every agent JSON to produce a
+    byte-identical dict — O(N) directory scans for one boot.
+    """
+    log = _Log({"title": "x"}, [])
+    shared = {"kirocrew": "sonnet"}
+    called = False
+
+    def _boom() -> dict[str, str]:
+        nonlocal called
+        called = True
+        return {}
+
+    original = cp._build_kiro_model_map
+    cp._build_kiro_model_map = _boom  # type: ignore[assignment]
+    try:
+        _m, _r, _msgs, model_map = cp._prefetch_rehydrate_inputs(
+            log, "dashboard:chat-1-x", kiro_model_map=shared
+        )
+    finally:
+        cp._build_kiro_model_map = original  # type: ignore[assignment]
+
+    assert model_map is shared
+    assert called is False, "the prefetch rebuilt a map the caller already had"
