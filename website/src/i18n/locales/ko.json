@@ -9978,7 +9978,11 @@
         "oauth_not_a_static_token": "이 서버는 OAuth로 로그인하므로 정적 Authorization 헤더로는 연결할 수 없습니다. 이 서버를 제거하고 헤더 없이 다시 추가하여 활성화한 다음, 새 채팅 세션을 시작해 로그인하세요.",
         "sign_in_required_next": "승인한 다음 이 표 위의 MCP 서버 탐색 버튼을 사용하세요. 그러면 행이 로그인됨으로 바뀝니다.",
         "signed_in": "로그인됨",
-        "signed_in_help": "{{provider}}에 대한 로그인은 Kiro CLI가 보유하고 있습니다. 탐색은 해당 토큰 없이 실행되므로 {{productName}}은(는) 로그인이 여전히 유효한지 확인할 수 없습니다."
+        "signed_in_help": "{{provider}}에 대한 로그인은 Kiro CLI가 보유하고 있습니다. 탐색은 해당 토큰 없이 실행되므로 {{productName}}은(는) 로그인이 여전히 유효한지 확인할 수 없습니다.",
+        "quarantined": "격리됨",
+        "quarantined_help": "연속 {{failures}}회 프로브 실패로 새 세션에 마운트되지 않습니다. 사용 설정은 변경되지 않았습니다.",
+        "remount": "다시 마운트",
+        "remount_help": "실패 횟수를 초기화하고 이 서버를 새 세션에 다시 마운트합니다."
       },
       "memoryGraphTab": {
         "all_count": "전체 ({{count}})",

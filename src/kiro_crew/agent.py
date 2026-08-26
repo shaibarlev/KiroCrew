@@ -73,6 +73,7 @@ from kiro_crew.env import (
 )
 from kiro_crew.mcp_cleanup import purge_deleted_proxy_from_config
 from kiro_crew.mcp_provenance import without_marker
+from kiro_crew.mcp_quarantine import quarantined_names as mcp_quarantined_names
 from kiro_crew.mcp_utils import kiro_oauth_wire_entry, mcp_server_alias
 from kiro_crew.platform import current_context
 from kiro_crew.platform import redact_via_context as redact
@@ -1101,6 +1102,112 @@ def _prompt_path(mode: str = "") -> Path:
     if user_prompt.is_file():
         return user_prompt
     return _shipped_prompt()
+
+
+def quarantine_eligible_aliases() -> set[str]:
+    """Emitted-config keys a probe-failure quarantine is allowed to unmount.
+
+    A quarantine works by DROPPING the server from the generated agent config, so
+    it may only touch keys whose configuration survives that drop. Both sides of
+    the feature consult this one function so the recording boundary and the mount
+    decision cannot drift into disagreeing about which servers are in play.
+
+    Excluded:
+
+    * **Kiro Crew's own managed servers.** Unmounting ``kirocrew-core`` would
+      remove the tools the product is made of (spawn_run, learn_add, the monitor
+      loop).
+
+    * **Servers configured ONLY in the generated agent config.** For those the
+      agent config is the sole persisted copy of the user's configuration --
+      reached by ``kiro-cli mcp add --agent kirocrew`` or a hand-edit -- so
+      dropping the entry would destroy it outright, with no source for discovery
+      or a later release to restore it from. Stamping ``disabled`` instead is no
+      better: ``mcp_discovery.list_servers`` adds such a name to
+      ``disabled_in_agent`` and then introduces it from nowhere, so the server's
+      own row disappears and with it the explanation and the release control.
+      Neither lever is safe for that scope, so it is left mounted -- a broken
+      agent-only server keeps costing a spawn per session, which is a smaller
+      harm than deleting configuration the user cannot get back.
+
+    * **A CONTESTED alias.** This is the subtle one. A shared scope's slashed key
+      (``npm:@x/airbnb``) is emitted under its slash-free alias (``x-airbnb``) --
+      but ``_normalize_mcp_server_keys`` only moves slashed keys, so if a
+      slash-free server of that exact name already occupies the alias, the SHARED
+      one is preserved at ``x-airbnb-2`` and the bare alias still belongs to the
+      other server. Treating the alias as eligible because a shared scope derives
+      it would then drop the wrong entry -- and when that occupant is agent-only,
+      the drop destroys its sole copy. So an alias derived from a slashed shared
+      key is eligible only while no slash-free key anywhere claims it.
+    """
+    scopes: list[dict[str, Any]] = [_load_json(_KIRO_MCP_JSON).get("mcpServers", {})]
+    scopes.append(_load_json(_user_dir() / "mcp.json").get("mcpServers", {}))
+    for _p in _extra_mcp_scope_globals():
+        scopes.append(_load_json(_p).get("mcpServers", {}))
+
+    # Every slash-free key any source spells, INCLUDING the generated agent
+    # config: those keys are never moved, so each one is the settled owner of its
+    # name and no derived alias may displace it.
+    #
+    # The generated config needs one exception, or this rule eats the feature: a
+    # slashed shared server's own normalized entry lives under that alias, so
+    # counting it as an occupant would make every slashed shared server
+    # permanently ineligible. An alias is contested only when its occupant is a
+    # DIFFERENT server, compared by normalized spec -- which is the identity check
+    # ``_alias_family_base`` warns is required.
+    agent_cfg = _load_json(kiro_agents_dir_path() / AGENT_FILENAME).get("mcpServers", {})
+    agent_specs: dict[str, Any] = agent_cfg if isinstance(agent_cfg, dict) else {}
+    shared_norms: dict[str, list[Any]] = {}
+    for scope in scopes:
+        if isinstance(scope, dict):
+            for name, spec in scope.items():
+                if isinstance(spec, dict):
+                    shared_norms.setdefault(mcp_server_alias(name), []).append(_norm_mcp_spec(spec))
+
+    occupied: set[str] = set()
+    for scope in scopes:
+        if isinstance(scope, dict):
+            occupied |= {n for n in scope if isinstance(n, str) and "/" not in n}
+    for name, spec in agent_specs.items():
+        if not isinstance(name, str) or "/" in name:
+            continue
+        if isinstance(spec, dict) and _norm_mcp_spec(spec) in shared_norms.get(name, []):
+            # This entry IS the shared server's normalized home, not a rival.
+            continue
+        occupied.add(name)
+
+    eligible: set[str] = set()
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        for name, spec in scope.items():
+            if not isinstance(spec, dict) or name in _MANAGED_MCP_SERVERS:
+                continue
+            if "/" not in name:
+                # Spelled slash-free by a shared scope: this key IS the shared
+                # server's home, and dropping it is recoverable from that scope.
+                eligible.add(name)
+                continue
+            alias = mcp_server_alias(name)
+            if alias in occupied:
+                # Contested: the bare alias belongs to whoever spelled it
+                # slash-free, and this server lives at ``<alias>-<n>``.
+                continue
+            eligible.add(alias)
+    return eligible
+
+
+def quarantine_effective_aliases() -> set[str]:
+    """The aliases a rebuild RIGHT NOW would actually unmount.
+
+    The single definition of the mount decision's quarantine input, so the
+    reconcile check that decides whether the emitted config is out of date cannot
+    disagree with the rebuild that produces it. Threshold changes, eligibility
+    changes and store resets all show up here.
+    """
+    return {
+        mcp_server_alias(srv) for srv in mcp_quarantined_names()
+    } & quarantine_eligible_aliases()
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -3722,6 +3829,23 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         for srv, srv_spec in scope.items()
         if isinstance(srv_spec, dict) and srv_spec.get("disabled")
     }
+    # A server the probe has failed N consecutive times is not mounted either --
+    # the THIRD input to this decision, alongside "the user disabled it" and
+    # "its command did not resolve". Without it a server that never completes a
+    # handshake is re-spawned by every new session forever, because a probe
+    # verdict reached inventory and display and stopped there.
+    #
+    # Kept separate from ``_disabled_anywhere`` rather than folded into it for
+    # two reasons. Auditing: the SEL record below has to say WHY a ref was
+    # removed, and "the operator turned it off" and "it has not answered since
+    # Tuesday" are different facts. And ownership: nothing here writes
+    # ``disabled`` into a config file the user owns, so releasing a quarantine
+    # cannot resurrect a server the user had switched off by hand.
+    #
+    # Aliased for the same reason as the disable set: the alias is the identity
+    # the emitted ``@ref`` carries, and the mapping is many-to-one.
+    _quarantined_aliases = quarantine_effective_aliases()
+    _shared_quarantined: list[str] = []
     for name, spec in itertools.chain(
         extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items()
     ):
@@ -3760,6 +3884,47 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
                     lst.remove(ref)
                 if ref not in _shared_not_auto:
                     _shared_not_auto.append(ref)
+    # Quarantine is applied as its OWN pass over ``valid_servers`` -- the emitted
+    # mount map -- rather than inside the scope walk above. The walk visits the
+    # three shared scopes and skips managed names, so a server reachable only
+    # through the agent config itself (``kiro-cli mcp add --agent kirocrew``, a
+    # hand-edit) was never visited and stayed mounted while the dashboard
+    # labelled it quarantined. The mount map is the complete set, so deciding
+    # against it cannot miss a server the decision is about.
+    #
+    # ``managed_names`` stays excluded, and deliberately: quarantining Kiro Crew's
+    # own servers would remove the tools the product is made of. So does a server
+    # configured ONLY here -- dropping its entry would destroy the sole copy of
+    # the user's configuration. Both exclusions live in
+    # ``quarantine_eligible_aliases``, which ``quarantine_effective_aliases``
+    # applies, so the recording side and the reconcile check reach the same
+    # verdict and no badge can claim an unmount that did not happen.
+    for alias in sorted(_quarantined_aliases):
+        if alias in managed_names or alias not in valid_servers:
+            continue
+        ref = f"@{alias}"
+        # Removing the ref stops the server being EXPOSED; the spec in
+        # ``mcpServers`` is what makes kiro-cli SPAWN it, and the per-session
+        # spawn is the cost this exists to stop paying -- so the entry is
+        # DROPPED from the emitted config.
+        #
+        # Dropped rather than stamped ``disabled: True``, which was the first
+        # attempt and is self-defeating: ``list_servers`` builds
+        # ``disabled_in_agent`` from this very file and then refuses to introduce
+        # those names from any other scope, so the stamp suppressed the server's
+        # own dashboard row -- taking the quarantine badge and the one control
+        # that releases it with it. Absence carries the same weight to kiro-cli
+        # and leaves the row visible, which is where the state gets explained.
+        #
+        # Only the emitted config is touched: it is regenerated from scratch on
+        # every rebuild, so this lives exactly as long as the quarantine does.
+        valid_servers.pop(alias, None)
+        for key in ("tools", "allowedTools"):
+            lst = config.get(key)
+            if lst is not None and ref in lst:
+                lst.remove(ref)
+        if ref not in _shared_quarantined:
+            _shared_quarantined.append(ref)
     if _shared_added:
         sel().log_api_access(
             caller="system",
@@ -3789,6 +3954,21 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
             outcome="ok",
             source="install_agent",
             resources=f"{', '.join(_shared_removed)} removed from tools/allowedTools (disabled)",
+        )
+    if _shared_quarantined:
+        # Its own record, not folded into the removal line above: an operator
+        # reading "removed (disabled)" would conclude a human did this. This is
+        # the one removal reason nobody chose, so it is the one that has to be
+        # attributable on its own.
+        sel().log_api_access(
+            caller="system",
+            operation="mcp_auto_quarantined",
+            outcome="ok",
+            source="install_agent",
+            resources=(
+                f"{', '.join(_shared_quarantined)} not mounted "
+                f"(consecutive probe failures); user enable/disable untouched"
+            ),
         )
 
     # On fresh installs, ensure managed MCP tools are in tools (but NOT

@@ -1527,6 +1527,22 @@ class AgentConfig:
             "and kirocrew-computer in the registry by those exact names.",
         ),
     )
+    mcp_quarantine_after_failures: int = field(
+        default=3,
+        metadata=_meta(
+            "Quarantine After Failed Probes",
+            "Consecutive failed probes before an MCP server stops being mounted "
+            "into new sessions. A probe verdict is otherwise display-only, so a "
+            "server that never completes its handshake is re-spawned by every "
+            "session forever -- this bounds that to a one-time cost. Counts only "
+            "'error' and 'timeout': a server asking for OAuth sign-in is working "
+            "correctly and is never counted, and one success clears the counter. "
+            "Quarantine is a state of its own, so it never overwrites a server "
+            "you disabled by hand, and the dashboard offers a one-click release. "
+            "It reaches NEW sessions -- a running session keeps the server until "
+            "it turns over. 0 turns the whole mechanism off.",
+        ),
+    )
     acp_backend: str = field(
         default="",
         metadata=_meta(
@@ -7145,6 +7161,9 @@ class KiroCrewConfig:
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
                 mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
+                mcp_quarantine_after_failures=_safe_int(
+                    agent_data.get("mcp_quarantine_after_failures", 3), 3
+                ),
                 acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
                 default_agent=agent_data.get("default_agent", ""),
                 sweep_agents_backups=_safe_bool(

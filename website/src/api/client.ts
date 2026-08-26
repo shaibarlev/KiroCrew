@@ -2358,6 +2358,8 @@ export const api = {
     put(`/api/mcp/custom/${encodeURIComponent(name)}`, { spec }).then(j) as Promise<{ ok: boolean; name: string }>,
   mcpActive: (agent?: string) => fetch('/api/mcp/active' + (agent ? `?agent=${encodeURIComponent(agent)}` : '')).then(j),
   mcpProbe: () => post('/api/mcp/probe').then(j),
+  mcpQuarantineClear: (name: string) =>
+    post('/api/mcp/quarantine/clear', { name }).then(j) as Promise<{ ok: boolean; name: string; released: boolean }>,
   mcpSync: () => post('/api/mcp/sync').then(j),
   mcpApply: (changes: McpApplyChange[]) =>
     post('/api/mcp/apply', { changes }).then(j),

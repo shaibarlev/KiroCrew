@@ -10274,7 +10274,11 @@
         "oauth_not_a_static_token": "Questo server accede tramite OAuth, quindi un header Authorization statico non è sufficiente. Rimuovi e aggiungi di nuovo il server senza l’header, attivalo, poi avvia una nuova sessione di chat per accedere.",
         "sign_in_required_next": "Dopo l’approvazione, usa il pulsante Sonda i server MCP sopra questa tabella; la riga mostrerà quindi Accesso effettuato.",
         "signed_in": "Accesso effettuato",
-        "signed_in_help": "Kiro CLI conserva un accesso per {{provider}}. Il sondaggio viene eseguito senza quel token, quindi {{productName}} non può confermare che l’accesso sia ancora valido."
+        "signed_in_help": "Kiro CLI conserva un accesso per {{provider}}. Il sondaggio viene eseguito senza quel token, quindi {{productName}} non può confermare che l’accesso sia ancora valido.",
+        "quarantined": "In quarantena",
+        "quarantined_help": "Non viene montato nelle nuove sessioni dopo {{failures}} probe fallite consecutive. La tua impostazione di attivazione non è cambiata.",
+        "remount": "Rimonta",
+        "remount_help": "Azzera il conteggio degli errori e rimonta questo server nelle nuove sessioni."
       },
       "memoryGraphTab": {
         "all_count": "Tutti ({{count}})",

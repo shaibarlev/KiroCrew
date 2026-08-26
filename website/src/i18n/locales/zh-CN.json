@@ -9978,7 +9978,11 @@
         "oauth_not_a_static_token": "此服务器通过 OAuth 登录，因此静态 Authorization 标头无法满足它。请移除此服务器，在不含该标头的情况下重新添加并启用它，然后启动新的聊天会话以登录。",
         "sign_in_required_next": "批准后，使用此表上方的“探测 MCP 服务器”按钮；该行随后会显示“已登录”。",
         "signed_in": "已登录",
-        "signed_in_help": "Kiro CLI 保存着 {{provider}} 的登录信息。探测在没有该令牌的情况下运行，因此 {{productName}} 无法确认该登录是否仍然有效。"
+        "signed_in_help": "Kiro CLI 保存着 {{provider}} 的登录信息。探测在没有该令牌的情况下运行，因此 {{productName}} 无法确认该登录是否仍然有效。",
+        "quarantined": "已隔离",
+        "quarantined_help": "连续 {{failures}} 次探测失败，已不再挂载到新会话。你的启用设置未被更改。",
+        "remount": "重新挂载",
+        "remount_help": "清除失败计数，让新会话重新挂载这个服务器。"
       },
       "memoryGraphTab": {
         "all_count": "全部（{{count}}）",

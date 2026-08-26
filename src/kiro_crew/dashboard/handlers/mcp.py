@@ -15,8 +15,14 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew import platform_compat
-from kiro_crew.agent import _atomic_json_write, kiro_agents_dir_path, rebuild_agent_config
+from kiro_crew import mcp_quarantine, platform_compat
+from kiro_crew.agent import (
+    _atomic_json_write,
+    kiro_agents_dir_path,
+    quarantine_effective_aliases,
+    quarantine_eligible_aliases,
+    rebuild_agent_config,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     FORWARD_DECLARED_ENV_DEFAULT,
@@ -475,6 +481,146 @@ def _sync_mcp_to_agent_batch_unlocked(names: list[str], enabled: bool) -> None:
         logger.warning("Cannot write agent config %s: %s", path, exc)
 
 
+def _quarantine_verdicts(rows: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+    """Extract ``(name, status, error)`` triples from probe rows.
+
+    Filtered to the servers a quarantine may actually unmount, via the same
+    ``quarantine_eligible_aliases`` the mount decision uses. Recording a verdict
+    for anything else could only ever produce a badge saying a server was
+    unmounted when it was not -- Kiro Crew's own managed servers are never touched,
+    and a server configured only in the generated agent config cannot be dropped
+    without destroying the sole copy of its configuration.
+    """
+    eligible = quarantine_eligible_aliases()
+    return [
+        (str(r.get("name") or ""), str(r.get("status") or ""), str(r.get("error") or ""))
+        for r in rows
+        if mcp_server_alias(str(r.get("name") or "")) in eligible
+    ]
+
+
+def _annotate_quarantine(rows: list[dict[str, Any]]) -> None:
+    """Stamp ``probeFailures`` / ``quarantined`` onto rows that have a record.
+
+    Applied at RESPONSE time rather than baked into the cached rows, so
+    releasing a server shows up on the next poll instead of waiting for a
+    re-probe (a release the UI cannot see reads as a broken button).
+
+    Servers with no failures on file get neither key, so a healthy fleet's wire
+    shape is byte-identical to before this feature.
+
+    Reads the store, so every caller runs it OFF the event loop -- see the
+    ``asyncio.to_thread`` at each call site.
+    """
+    try:
+        snap = mcp_quarantine.snapshot()
+    except Exception:
+        logger.debug("cannot read MCP quarantine state", exc_info=True)
+        return
+    for row in rows:
+        state = snap.get(str(row.get("name") or ""))
+        if state:
+            row["probeFailures"] = state["fails"]
+            row["quarantined"] = state["quarantined"]
+
+
+def _record_probe_verdicts(rows: list[dict[str, Any]]) -> None:
+    """Filter probe rows to eligible servers and fold them into the store.
+
+    One function so ONE ``to_thread`` covers both halves. Passing
+    ``_quarantine_verdicts(rows)`` as an argument to ``to_thread`` evaluated it on
+    the event loop, and that filter reads up to three MCP scope files to decide
+    eligibility -- so the loop paid for those reads on every probe round.
+    """
+    mcp_quarantine.record_verdicts(_quarantine_verdicts(rows))
+
+
+async def _reconcile_quarantine_mounts(*, applied_unknown: bool = False) -> bool:
+    """Take the agent-config lock and reconcile. See ``_reconcile_locked``.
+
+    The lock is the one ``api_mcp_toggle`` and the agents handlers already use for
+    agent-config writes, not a new one: ``rebuild_agent_config`` is a
+    read-modify-write of that whole file, so two of them running concurrently can
+    lose each other's changes -- quarantine-related or not. Reusing the existing
+    mutex also serialises this against the toggle path, which patches the same
+    file.
+    """
+    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
+
+    async with _get_config_lock():
+        return await _reconcile_locked(applied_unknown=applied_unknown)
+
+
+async def _reconcile_locked(*, applied_unknown: bool = False) -> bool:
+    """Rebuild the agent config when it no longer matches the quarantine decision.
+
+    Callers must hold the agent-config lock; ``_reconcile_quarantine_mounts`` is
+    the wrapper that takes it. The read of the desired set, the rebuild and the
+    marker write have to be ONE critical section: a concurrent Remount between the
+    snapshot and the marker write left the marker naming a set the emitted config
+    no longer reflected, and two concurrent rebuilds of the same file can lose each
+    other's work outright.
+
+    Returns whether the emitted config now MATCHES the decision -- True when it
+    already did or the rebuild succeeded, False only when the rebuild failed.
+    Callers must branch on this rather than on whether the applied marker moved: a
+    rebuild can succeed and its marker write still fail, and reading that as a
+    failed rebuild is worse than the failure it is trying to handle (see the
+    release endpoint's rollback).
+
+    IDEMPOTENT rather than transition-driven, and that is the point. Earlier
+    revisions triggered the rebuild off "what changed on this call", which needs
+    correct bookkeeping at every site that can cause a divergence -- and each site
+    that got it wrong produced a permanently inconsistent config: a rebuild that
+    failed consumed the transition forever, a threshold change moved the decision
+    with no verdict to report it, and a store reset emptied the set silently.
+
+    This compares the set a rebuild WOULD emit now against the set the last
+    successful rebuild DID emit, so every one of those is the same check. A failed
+    rebuild simply does not advance the marker, so the next probe round retries.
+
+    ``applied_unknown`` is the one case the comparison cannot cover: the marker
+    lived in the store file, so a store that had to be RESET after becoming
+    unreadable leaves it genuinely unknown rather than known-empty, and "unknown"
+    must not be allowed to compare equal to "nothing was unmounted". One rebuild
+    settles it.
+
+    Reaches sessions that start from here on. It deliberately does NOT tear down
+    running sessions or the warm pool: a live session's kiro-cli read its agent
+    spec at spawn and never re-reads it, so propagating would mean killing the
+    process mid-turn to reclaim a core. Losing a user's in-flight work is the
+    worse end of that trade, and the dashboard already owns the explicit path for
+    it (``POST /api/sessions/restart``).
+    """
+    desired = await asyncio.to_thread(quarantine_effective_aliases)
+    applied = await asyncio.to_thread(mcp_quarantine.applied_aliases)
+    if desired == applied and not applied_unknown:
+        return True
+    try:
+        await asyncio.to_thread(rebuild_agent_config)
+    except Exception:
+        logger.warning(
+            "MCP quarantine set is %s but the emitted config reflects %s; "
+            "the rebuild failed and will be retried on the next probe",
+            sorted(desired) or "empty",
+            sorted(applied) or "empty",
+            exc_info=True,
+        )
+        return False
+    try:
+        await asyncio.to_thread(mcp_quarantine.mark_applied, desired)
+    except OSError:
+        # The config IS correct; only the marker did not land, so the next round
+        # rebuilds once more. Wasteful, never wrong -- and reported as a match,
+        # because the config matches.
+        logger.warning("cannot record the applied MCP quarantine set", exc_info=True)
+    logger.info(
+        "MCP quarantine set is now %s; the agent config was rebuilt so new sessions follow it",
+        sorted(desired) or "empty",
+    )
+    return True
+
+
 async def _bg_mcp_probe() -> None:
     """Populate the MCP probe cache — SINGLE-FLIGHT.
 
@@ -540,6 +686,12 @@ async def _run_mcp_probe() -> None:
             if isinstance(spec, dict) and spec.get("disabledTools"):
                 d["disabledTools"] = spec["disabledTools"]
             result.append(d)
+        unreadable = await asyncio.to_thread(mcp_quarantine.reset_unreadable_store)
+        if unreadable:
+            logger.info("MCP quarantine store was reset; reconciling the emitted config")
+        await asyncio.to_thread(_record_probe_verdicts, result)
+        await _reconcile_quarantine_mounts(applied_unknown=unreadable)
+        await asyncio.to_thread(_annotate_quarantine, result)
         _mcp_probe_cache[:] = result
         _mcp_probe_ts = time.time()
         logger.info("MCP probe complete: %d servers", len(result))
@@ -640,6 +792,12 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
             err, _ = redact_exfiltration_urls(err)
             d["error"] = err
         result.append(d)
+    # Annotated HERE too, not only on the probe endpoints. This is the endpoint
+    # the MCP table loads from, so without it a quarantined server rendered as a
+    # plain failing row until the user happened to press Probe -- the badge
+    # explaining why it was unmounted, and the only control that releases it,
+    # were both absent on the surface a user actually lands on.
+    await asyncio.to_thread(_annotate_quarantine, result)
     return web.json_response(result)
 
 
@@ -738,6 +896,12 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
         if isinstance(spec, dict) and spec.get("disabledTools"):
             d["disabledTools"] = spec["disabledTools"]
         result.append(d)
+    unreadable = await asyncio.to_thread(mcp_quarantine.reset_unreadable_store)
+    if unreadable:
+        logger.info("MCP quarantine store was reset; reconciling the emitted config")
+    await asyncio.to_thread(_record_probe_verdicts, result)
+    await _reconcile_quarantine_mounts(applied_unknown=unreadable)
+    await asyncio.to_thread(_annotate_quarantine, result)
     _mcp_probe_cache[:] = result
     _mcp_probe_ts = time.time()
     return web.json_response(result)
@@ -865,7 +1029,116 @@ async def api_mcp_probe_cached(request: web.Request) -> web.Response:
         if "headers" in item:
             item["headers"] = redact_mcp_headers(cached_headers)
         result.append(item)
+    await asyncio.to_thread(_annotate_quarantine, result)
     return web.json_response(result)
+
+
+async def api_mcp_quarantine_clear(request: web.Request) -> web.Response:
+    """POST /api/mcp/quarantine/clear — release an auto-quarantined MCP server.
+
+    Clears the consecutive-failure COUNTER as well as the quarantine flag.
+    Releasing a server but leaving it one failure short of re-quarantine would
+    make the button look broken -- the user would press it, the server would
+    fail once, and it would vanish again.
+
+    Deliberately does NOT touch ``disabled`` in any config file: this releases
+    only the verdict Kiro Crew formed on its own, so a server the user had
+    switched off by hand stays off.
+
+    The release and its reconcile run inside ONE hold of the agent-config lock, so
+    a probe round's reconcile cannot interleave between them and commit a decision
+    taken before this release happened.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        # A JSON array or bare null parses fine and then reaches ``.get`` on the
+        # identifier read, which surfaces as a 500 for what is a malformed
+        # request.
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "body_not_object"}, status=400
+        )
+    name, err = _string_identifier(body, "name")
+    if err is not None:
+        return err
+    if not name:
+        return web.json_response(
+            {"error": "name is required", "code": "name_required"}, status=400
+        )
+
+    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
+
+    async with _get_config_lock():
+        try:
+            removed = await asyncio.to_thread(mcp_quarantine.clear, name)
+        except OSError:
+            # The store write failed, so nothing was released. Reporting success
+            # here would tell the user the server is back while the record that
+            # unmounts it is still on disk.
+            logger.warning("quarantine store write failed releasing %s", name, exc_info=True)
+            return web.json_response(
+                {
+                    "error": "cannot write the quarantine store",
+                    "code": "quarantine_store_write_failed",
+                },
+                status=500,
+            )
+        released = removed is not None
+
+        # Reconcile rather than rebuild blindly: it compares what a rebuild would
+        # emit against what the last one did, so a release makes them differ and
+        # gets its rebuild, and a retry after an earlier partial failure gets one
+        # too. Called in its already-locked form so the release above and this
+        # cannot be split by a probe round's reconcile.
+        #
+        # Branch on the RECONCILE'S OWN verdict, not on whether the applied marker
+        # moved. Using the marker as a proxy was wrong in a way that made things
+        # worse: a rebuild can succeed while only its marker write fails, and
+        # reading that as a failed rebuild rolled the release back -- leaving the
+        # emitted config with the server mounted while the store said it was
+        # quarantined.
+        in_sync = await _reconcile_locked()
+        if not in_sync and removed is not None:
+            # The reconcile did not land, so the server is released in the store
+            # but still absent from the emitted config. ROLL THE RELEASE BACK:
+            # otherwise it is unrecoverable from the UI, because the store says
+            # released, so the badge and the Remount control both disappear on the
+            # next poll -- and the control the user would retry with is the one
+            # that just vanished. Putting the record back keeps the server visibly
+            # quarantined, which is also the truth, since it is still not mounted.
+            code = "agent_config_rebuild_failed"
+            try:
+                await asyncio.to_thread(mcp_quarantine.restore, name, removed)
+            except OSError:
+                # Both writes failed. Say so rather than implying the state is
+                # intact -- the store now disagrees with the emitted config, and
+                # the next probe round's reconcile is what will settle it.
+                logger.warning("quarantine rollback also failed for %s", name, exc_info=True)
+                code = "agent_config_rebuild_failed_rollback_failed"
+            return web.json_response(
+                {
+                    "error": "agent config rebuild failed; the release was rolled back",
+                    "code": code,
+                },
+                status=500,
+            )
+    if released:
+        sel().log_api_access(
+            caller="dashboard",
+            operation="mcp_quarantine_released",
+            outcome="ok",
+            source="dashboard",
+            resources=f"{name} released from probe-failure quarantine",
+        )
+        # The cached probe rows carry the old annotation; drop the row's keys so
+        # a poll that lands before the next probe does not re-render the badge.
+        for row in _mcp_probe_cache:
+            if row.get("name") == name:
+                row.pop("quarantined", None)
+                row.pop("probeFailures", None)
+    return web.json_response({"ok": True, "name": name, "released": released})
 
 
 async def api_mcp_sync(request: web.Request) -> web.Response:

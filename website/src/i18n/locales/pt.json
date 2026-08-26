@@ -10274,7 +10274,11 @@
         "oauth_not_a_static_token": "Este servidor inicia sessão com OAuth, por isso um cabeçalho Authorization estático não é suficiente. Remova e volte a adicionar este servidor sem o cabeçalho, ative-o e depois inicie uma nova sessão de chat para iniciar sessão.",
         "sign_in_required_next": "Depois de aprovar, use o botão Testar servidores MCP acima desta tabela; a linha passará então a Sessão iniciada.",
         "signed_in": "Sessão iniciada",
-        "signed_in_help": "O Kiro CLI mantém um início de sessão para {{provider}}. A sondagem é executada sem esse token, por isso o {{productName}} não pode confirmar que o início de sessão continua válido."
+        "signed_in_help": "O Kiro CLI mantém um início de sessão para {{provider}}. A sondagem é executada sem esse token, por isso o {{productName}} não pode confirmar que o início de sessão continua válido.",
+        "quarantined": "Em quarentena",
+        "quarantined_help": "Não é montado em novas sessões após {{failures}} sondagens falhadas consecutivas. A sua definição de ativação não foi alterada.",
+        "remount": "Montar novamente",
+        "remount_help": "Limpa a contagem de falhas e volta a montar este servidor em novas sessões."
       },
       "memoryGraphTab": {
         "all_count": "Todos ({{count}})",

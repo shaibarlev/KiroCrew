@@ -2084,6 +2084,258 @@ class TestToolBloatFixes:
         entry = config.get("mcpServers", {}).get("notion")
         assert entry is None or entry.get("disabled") is True, "the flag must reach the spec"
 
+    def test_a_quarantined_server_is_not_mounted(self, tmp_path: Path, monkeypatch):
+        """A probe verdict has to reach the mount decision.
+
+        Before this, ``rebuild_agent_config`` read exactly two things -- the
+        user's ``disabled`` and whether the command resolved -- so a server that
+        had failed its handshake N times running was still written into ``tools``
+        and re-spawned by every new session, forever.
+
+        Both halves are asserted, because removing the ``@ref`` alone is not
+        enough: the ref is what EXPOSES the server, but the ``mcpServers`` entry
+        is what makes kiro-cli SPAWN it, and the per-session spawn is the cost
+        this exists to stop paying.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        (tmp_path / "fake_kiro_mcp.json").write_text(
+            json.dumps({"mcpServers": {"airbnb": {"command": "npx", "args": ["-y", "airbnb-mcp"]}}})
+        )
+        monkeypatch.setattr("kiro_crew.agent.mcp_quarantined_names", lambda: {"airbnb"})
+
+        path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+
+        assert "@airbnb" not in config.get("tools", []), "quarantined server must not mount"
+        assert "@airbnb" not in config.get("allowedTools", []), "nor be auto-approved"
+        assert "airbnb" not in config.get("mcpServers", {}), (
+            "the emitted spec must not carry the server at all, or kiro-cli spawns it"
+        )
+
+    def test_a_quarantine_does_not_stamp_disabled_into_the_emitted_config(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Absence, not ``disabled: True``. The stamp is self-defeating.
+
+        ``list_servers`` builds ``disabled_in_agent`` from the generated agent
+        config and then refuses to introduce those names from any other scope
+        (``mcp_discovery.py``, the ``name not in disabled_in_agent`` guard). So a
+        stamped entry suppressed the server's own dashboard row -- taking the
+        quarantine badge and the only control that releases it with it, leaving a
+        server unmounted with no surface anywhere that says why.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        (tmp_path / "fake_kiro_mcp.json").write_text(
+            json.dumps({"mcpServers": {"airbnb": {"command": "npx", "args": ["-y", "x"]}}})
+        )
+        monkeypatch.setattr("kiro_crew.agent.mcp_quarantined_names", lambda: {"airbnb"})
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8")).get("mcpServers", {}).get("airbnb")
+
+        assert entry is None, "a quarantined entry must be absent, not present-and-disabled"
+
+    def test_a_quarantine_never_writes_the_users_config(self, tmp_path: Path, monkeypatch):
+        """Quarantine is a third state, not a second writer of ``disabled``.
+
+        If it flipped the user's own key, a release could resurrect a server
+        they had switched off by hand, and they would have no way to tell which
+        flag they were looking at.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_mcp = tmp_path / "fake_kiro_mcp.json"
+        original = json.dumps({"mcpServers": {"airbnb": {"command": "npx", "args": ["-y", "x"]}}})
+        kiro_mcp.write_text(original)
+        monkeypatch.setattr("kiro_crew.agent.mcp_quarantined_names", lambda: {"airbnb"})
+
+        _run_install(tmp_path, cfg_dir)
+
+        assert kiro_mcp.read_text() == original, "the user's own config must be untouched"
+
+    def test_a_quarantine_release_remounts_the_server(self, tmp_path: Path, monkeypatch):
+        """The state is derived, not sticky: the next rebuild restores the ref.
+
+        The quarantine lives only in its own store and in the GENERATED spec, so
+        clearing the store and rebuilding has to be sufficient -- with nothing
+        left behind in the agent config to undo.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        (tmp_path / "fake_kiro_mcp.json").write_text(
+            json.dumps({"mcpServers": {"airbnb": {"command": "npx", "args": ["-y", "x"]}}})
+        )
+        monkeypatch.setattr("kiro_crew.agent.mcp_quarantined_names", lambda: {"airbnb"})
+        path = _run_install(tmp_path, cfg_dir)
+        assert "@airbnb" not in json.loads(path.read_text()).get("tools", [])
+
+        monkeypatch.setattr("kiro_crew.agent.mcp_quarantined_names", lambda: set())
+        path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+
+        assert "@airbnb" in config.get("tools", []), "release must remount on the next rebuild"
+        entry = config.get("mcpServers", {}).get("airbnb", {})
+        assert "disabled" not in entry, "and must not leave the stamped disable behind"
+        assert entry.get("command") == "npx", "the server itself must come back"
+
+    def test_an_agent_only_server_is_left_mounted(self, tmp_path: Path, monkeypatch):
+        """Its spec here is the ONLY copy, so a quarantine must not drop it.
+
+        An earlier revision popped the entry for these too, which destroyed the
+        user's configuration outright: nothing else on disk defines the server, so
+        discovery could not find it again and a release had no source to restore
+        it from. Stamping ``disabled`` instead is no better -- ``list_servers``
+        adds such a name to ``disabled_in_agent`` and then introduces it from
+        nowhere, so the row disappears along with the badge and the release
+        control. Neither lever is safe here, so the server stays mounted, and the
+        recording side excludes it too so no badge claims otherwise.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"loner": {"command": "npx", "args": ["-y", "x"]}},
+                    "tools": ["@loner"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("kiro_crew.agent.mcp_quarantined_names", lambda: {"loner"})
+
+        path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+
+        entry = config.get("mcpServers", {}).get("loner")
+        assert entry is not None, "the sole copy of the user's config must survive"
+        assert entry.get("command") == "npx"
+        assert "disabled" not in entry, "and must not be hidden from its own row"
+
+    def test_a_scope_backed_server_is_still_quarantined(self, tmp_path: Path, monkeypatch):
+        """The exclusion above must not swallow the normal case.
+
+        A server defined in a shared scope survives being dropped from the
+        generated config, so it is exactly what a quarantine may unmount.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        (tmp_path / "fake_kiro_mcp.json").write_text(
+            json.dumps({"mcpServers": {"airbnb": {"command": "npx", "args": ["-y", "x"]}}})
+        )
+        monkeypatch.setattr("kiro_crew.agent.mcp_quarantined_names", lambda: {"airbnb"})
+
+        path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+
+        assert "airbnb" not in config.get("mcpServers", {})
+        assert "@airbnb" not in config.get("tools", [])
+
+    def test_a_contested_alias_is_never_quarantined(self, tmp_path: Path, monkeypatch):
+        """The drop must not hit an entry the shared scope does not own.
+
+        ``_normalize_mcp_server_keys`` moves only SLASHED keys, so when a
+        slash-free server already occupies the alias a slashed shared key derives,
+        the shared one is preserved at ``<alias>-2`` and the bare alias still
+        belongs to the other server. Treating the alias as eligible because a
+        shared scope derives it dropped the wrong entry -- and when the occupant is
+        agent-only, that destroys its sole copy of the user's configuration.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        # Agent-only server occupying the bare alias, sole copy.
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"x-airbnb": {"command": "npx", "args": ["-y", "mine"]}},
+                    "tools": ["@x-airbnb"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Shared scope spells a DIFFERENT server whose alias collides.
+        (tmp_path / "fake_kiro_mcp.json").write_text(
+            json.dumps({"mcpServers": {"npm:@x/airbnb": {"command": "npx", "args": ["theirs"]}}})
+        )
+        monkeypatch.setattr("kiro_crew.agent.mcp_quarantined_names", lambda: {"x-airbnb"})
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8")).get("mcpServers", {}).get("x-airbnb")
+
+        assert entry is not None, "the contested alias must not be dropped"
+        assert entry.get("args") == ["-y", "mine"], "and the occupant must be untouched"
+
+    def test_a_slashed_shared_server_stays_quarantinable(self, tmp_path: Path, monkeypatch):
+        """The contested-alias guard must not eat the ordinary case.
+
+        A slashed shared key is emitted under its slash-free alias, so after the
+        first rebuild that alias exists in the generated config -- as the shared
+        server's OWN home. Counting that as an occupant made every slashed shared
+        server permanently ineligible, silently disabling the feature for them.
+        Contested means a DIFFERENT server holds the alias, compared by normalized
+        spec.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        shared = {"command": "npx", "args": ["-y", "x"]}
+        (tmp_path / "fake_kiro_mcp.json").write_text(
+            json.dumps({"mcpServers": {"npm:@x/airbnb": shared}})
+        )
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        # The already-normalized emitted entry for that same shared server.
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps({"mcpServers": {"x-airbnb": dict(shared)}, "tools": ["@x-airbnb"]}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("kiro_crew.agent.mcp_quarantined_names", lambda: {"npm:@x/airbnb"})
+
+        path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+
+        assert "x-airbnb" not in config.get("mcpServers", {}), (
+            "a slashed shared server must still be quarantinable"
+        )
+        assert "@x-airbnb" not in config.get("tools", [])
+
+    def test_a_managed_server_is_never_quarantined(self, tmp_path: Path, monkeypatch):
+        """Quarantining Kiro Crew's own servers would remove the product's tools.
+
+        ``kirocrew-core`` carries spawn_run, learn_add and the monitor loop. Even
+        if a record somehow named one, the mount decision must ignore it -- the
+        recording side excludes managed names as well, so the two agree.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.agent.mcp_quarantined_names", lambda: {"kirocrew-core", "kirocrew-cron"}
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+
+        assert "kirocrew-core" in config.get("mcpServers", {}), "managed servers must survive"
+        assert "@kirocrew-core" in config.get("tools", [])
+
+    def test_the_quarantine_gate_matches_on_the_alias(self, tmp_path: Path, monkeypatch):
+        """Aliased for the same reason the disable gate is.
+
+        Agent refs are written as ``@<mcp_server_alias(name)>``, so a slashed
+        config key mounts a slash-free ref. Comparing raw names would let the
+        emitted ref survive the quarantine of the server that produced it.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        (tmp_path / "fake_kiro_mcp.json").write_text(
+            json.dumps({"mcpServers": {"npm:@acme/airbnb": {"command": "npx", "args": ["x"]}}})
+        )
+        monkeypatch.setattr(
+            "kiro_crew.agent.mcp_quarantined_names", lambda: {"npm:@acme/airbnb"}
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+
+        from kiro_crew.mcp_utils import mcp_server_alias
+
+        alias = mcp_server_alias("npm:@acme/airbnb")
+        assert f"@{alias}" not in config.get("tools", []), "the aliased ref must be removed too"
+
     def test_a_disabled_server_stays_disabled_when_the_store_uses_the_alias_key(
         self, tmp_path: Path
     ):

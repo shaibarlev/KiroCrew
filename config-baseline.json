@@ -23,6 +23,7 @@
         "reasoning_effort": "",
         "provider": "acp",
         "mcp_registry_mode": false,
+        "mcp_quarantine_after_failures": 3,
         "acp_backend": "",
         "default_agent": "",
         "sweep_agents_backups": false,
@@ -240,6 +241,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
+    },
+    {
+      "path": "agent.mcp_quarantine_after_failures",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Quarantine After Failed Probes",
+      "help": "Consecutive failed probes before an MCP server stops being mounted into new sessions. A probe verdict is otherwise display-only, so a server that never completes its handshake is re-spawned by every session forever -- this bounds that to a one-time cost. Counts only 'error' and 'timeout': a server asking for OAuth sign-in is working correctly and is never counted, and one success clears the counter. Quarantine is a state of its own, so it never overwrites a server you disabled by hand, and the dashboard offers a one-click release. It reaches NEW sessions -- a running session keeps the server until it turns over. 0 turns the whole mechanism off.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 3
     },
     {
       "path": "agent.acp_backend",
