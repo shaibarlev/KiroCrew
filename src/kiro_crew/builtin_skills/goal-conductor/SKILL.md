@@ -83,21 +83,21 @@ beats more parallelism: every open item is a session the user may have to read.
 
 For each item in the round:
 
-1. `chat_folder_create` once per goal (skip if it exists) so every session for
-   this goal lands in one place.
-2. `session_create` with a title that says what the item is FOR, and `agent` set
-   to the crew that fits. Call `select_crew` first and pass the agent it names —
+1. `session_create` with a title that says what the item is FOR, `folder` set to
+   the goal's folder (missing path segments are created automatically, and the
+   session is filed as part of creation — there is no separate move step and no
+   window where the folder can vanish between the two), and `agent` set to the
+   crew that fits. Call `select_crew` first and pass the agent it names —
    the matched crew when the item is clearly a specialist's job, otherwise the
    `default_agent` it returns. **Do NOT leave `agent` unset to "inherit the
    default":** the value inherited is YOUR agent, `kirocrew-conductor`, whose
    spec deliberately has no `fs_write` — so the child could not write a file even
    though writing one is the work you dispatched it to do, and the item would
    look stalled rather than misconfigured.
-3. `chat_folder_move_session` to file the new session under the goal's folder.
-4. `session_send` the seed prompt into the new session — the item's goal, its
+2. `session_send` the seed prompt into the new session — the item's goal, its
    acceptance condition, and where to report. The seed is the item's whole
    contract: the child session gets no other context from you.
-5. `session_ledger_record` the item: its goal text, the round number, and — in
+3. `session_ledger_record` the item: its goal text, the round number, and — in
    `artifacts`, under an `item-<n>` key — the durable item entry carrying its
    acceptance spec, session key, round, status and read cursor. **Never
    hand-write the entry value: encode it with the bundled codec**

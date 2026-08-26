@@ -246,6 +246,15 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "Agent to bind the session to. Omit to use the default agent."
                         ),
                     },
+                    "folder": {
+                        "type": "string",
+                        "description": (
+                            "Sidebar folder to file the new session into, atomically with "
+                            "creation — a folder id or a '/'-separated human path. Missing "
+                            "path segments are created (mkdir -p), like chat_folder_create's "
+                            "`parent`. Omit to leave the session at the top level."
+                        ),
+                    },
                 },
                 "required": [],
             },
@@ -470,9 +479,13 @@ def _resolve_chat_folder_ref(
     paths = _chat_folder_paths(folders)
     exact = sorted(fid for fid, p in paths.items() if p.strip().lower() == ref.lower())
     if len(exact) > 1:
-        return "", [], (
-            f"{len(exact)} folders render the same path {redact(ref)} "
-            f"({', '.join(exact)}) — pass the folder id instead of a path"
+        return (
+            "",
+            [],
+            (
+                f"{len(exact)} folders render the same path {redact(ref)} "
+                f"({', '.join(exact)}) — pass the folder id instead of a path"
+            ),
         )
 
     # Reading 3: walk the segments. When the exact reading already resolved, the
@@ -486,9 +499,13 @@ def _resolve_chat_folder_ref(
         return "", created, walk_err
 
     if exact and walked and walked != exact[0]:
-        return "", [], (
-            f"{redact(ref)} is ambiguous: it is both a folder's own name "
-            f"({exact[0]}) and a nested path ({walked}) — pass the folder id"
+        return (
+            "",
+            [],
+            (
+                f"{redact(ref)} is ambiguous: it is both a folder's own name "
+                f"({exact[0]}) and a nested path ({walked}) — pass the folder id"
+            ),
         )
     if exact:
         return exact[0], [], None
@@ -581,9 +598,7 @@ def _ensure_chat_folder_path(
     segments are real folders, and each must be created under the identity the
     caller's gate verified rather than one the write helper re-derives.
     """
-    return _resolve_chat_folder_ref(
-        ref, folders, create_missing=True, session_key=session_key
-    )
+    return _resolve_chat_folder_ref(ref, folders, create_missing=True, session_key=session_key)
 
 
 def _resolve_chat_slot_key(ref: str, slots: list[dict]) -> tuple[str, str | None]:
@@ -795,8 +810,7 @@ def _refuse_tree_shaping_if_unverifiable(verb: str) -> tuple[str, str | None]:
         return "", (
             f"Error: cannot verify which session is calling, so {verb} is "
             "refused — reshaping the shared folder tree requires a caller "
-            "identity the gateway can vouch for."
-            + strict_identity_diagnosis(SERVER_NAME)
+            "identity the gateway can vouch for." + strict_identity_diagnosis(SERVER_NAME)
         )
     rows, err = _get_rows("/api/chat/slots")
     if err:
@@ -859,15 +873,53 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 
     if name == "session_create":
         args = validate_tool_args(args, SESSION_CREATE_SCHEMA)
+        payload: dict[str, Any] = {"title": args.get("title", ""), "agent": args.get("agent", "")}
+        folder_ref = str(args.get("folder") or "")
+        folder_label = ""
+        made_note = ""
+        if folder_ref:
+            # Filing at creation resolves the reference with
+            # ``chat_folder_create``'s `parent` semantics — missing path segments
+            # are CREATED — and creating folders is tree shaping, so the same
+            # gate applies rather than a second authorization path: a caller
+            # that could not reshape the tree by creating a folder must not
+            # reach the same write by naming the path here (#6118). The gate's
+            # verified key is what the segment creation writes under, per its
+            # own contract.
+            gate_key, gate = _refuse_tree_shaping_if_unverifiable(
+                "filing a new session at creation"
+            )
+            if gate:
+                return gate
+            chat_folders, folders_err = _get_rows("/api/chat/folders")
+            if folders_err:
+                return redact(f"Error: {folders_err}")
+            fld_id, created_segments, fld_err = _ensure_chat_folder_path(
+                folder_ref, chat_folders, session_key=gate_key
+            )
+            if created_segments:
+                made_note = f" (created folder path: {'/'.join(created_segments)})"
+            if fld_err:
+                # Refuse the whole create: the caller asked for a session filed
+                # in this folder, and "created but unfiled" would silently honor
+                # half of that. No SESSION exists yet; path segments the mkdir -p
+                # walk already created DO persist and are reported in
+                # `made_note` — the same partial-report posture
+                # chat_folder_create takes, since folder deletion is
+                # deliberately not a capability this server has.
+                return redact(f"Error: {fld_err}{made_note}")
+            payload["folder_id"] = fld_id
+            folder_label = _chat_folder_paths(chat_folders).get(fld_id, fld_id)
         resp = _post(
             "/api/session-control/create",
-            {"title": args.get("title", ""), "agent": args.get("agent", "")},
+            payload,
             session_key=caller_key,
         )
         if resp.get("error"):
-            return f"Error: could not create a session: {resp['error']}"
-        return (
-            f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}). "
+            return redact(f"Error: could not create a session: {resp['error']}{made_note}")
+        filed = f" filed in `{folder_label}`" if folder_label else ""
+        return redact(
+            f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}.{made_note} "
             "It is empty and waiting in the user's sidebar; watch it with "
             "session_read_message."
         )

@@ -2630,6 +2630,13 @@ SESSION_CREATE_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("title", str, required=False, default="", max_len=200),
         FieldSpec("agent", str, required=False, default="", max_len=MAX_SHORT_STRING),
+        # A sidebar-folder reference — a folder id OR a ``/``-separated human
+        # path, the same shape ``chat_folder_move_session.folder`` takes — so
+        # filing is atomic with creation instead of a create-then-move pair a
+        # folder delete can land between (#6118). Bounded like every other
+        # folder reference; the two readings share no charset, so only the
+        # length is checked here.
+        FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
     ],
 )
 

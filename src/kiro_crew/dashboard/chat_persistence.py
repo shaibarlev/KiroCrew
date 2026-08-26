@@ -108,9 +108,7 @@ def _rehydrate_slot_title(
     slot.title = safe_title
     slot._titled = titled
     slot._title_origin = _rehydrate_title_origin(titled, metadata.get("title_origin"))
-    slot._title_refresh_mark = _rehydrate_title_refresh_mark(
-        metadata.get("title_refresh_mark")
-    )
+    slot._title_refresh_mark = _rehydrate_title_refresh_mark(metadata.get("title_refresh_mark"))
 
 
 _MAX_HISTORY_CHARS = 8000
@@ -291,9 +289,7 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
         # separators; reject any that do, warn so an attempted breakout is
         # visible, and keep restoring the rest.
         if "/" in raw or "\\" in raw:
-            logger.warning(
-                "restore_open_slots: rejecting key with path separators: %r", raw
-            )
+            logger.warning("restore_open_slots: rejecting key with path separators: %r", raw)
             continue
         # Fold to the canonical (filename-charset) key. Snapshots written
         # before slot-key normalization landed may carry a raw display-style
@@ -313,9 +309,7 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
             # This read MUST stay inside the per-tab guard. restore_open_slots_async
             # has no except at its call site, so anything escaping here aborts
             # dashboard startup and costs every LATER tab too, not just this one.
-            meta, readable = state.conversation_log.get_metadata_status(
-                slot_transcript_key(raw)
-            )
+            meta, readable = state.conversation_log.get_metadata_status(slot_transcript_key(raw))
             if readable:
                 slot = _rehydrate_slot_from_history(
                     state, raw, kiro_model_map=kiro_model_map, _prefetched_meta=meta
@@ -468,8 +462,10 @@ def _rehydrate_slot_from_history(
     # loop-affine: it broadcasts through ``asyncio.Queue.put_nowait`` and
     # ``Event.set``, neither of which is thread-safe. Omit them and the reads
     # happen inline, which is what the synchronous callers want.
-    meta = _prefetched_meta if _prefetched_meta is not None else (
-        state.conversation_log.get_metadata(history_key)
+    meta = (
+        _prefetched_meta
+        if _prefetched_meta is not None
+        else (state.conversation_log.get_metadata(history_key))
     )
     # No metadata → session was never persisted. Don't create a phantom slot.
     if not meta:
@@ -509,8 +505,7 @@ def _rehydrate_slot_from_history(
             # ``channel_slot_reconciler`` instead, which sets the flag -- and the
             # first save then persists it, so later boots need no inference.
             channel_origin=(
-                bool(meta.get("channel_origin"))
-                or bool(meta.get("linked_session_key"))
+                bool(meta.get("channel_origin")) or bool(meta.get("linked_session_key"))
             ),
             # Restore the persisted origin. Re-deriving it here would relabel
             # every rehydrated slot on restart, so a cron slot would come back
@@ -565,7 +560,9 @@ def _rehydrate_slot_from_history(
                 kiro_name = mc.kiro_agent if mc and mc.kiro_agent else slot.agent
                 slot.model = kiro_model_map.get(kiro_name, "")
             except Exception:
-                logger.debug("Failed to resolve model for rehydrated slot %s", slot_name, exc_info=True)
+                logger.debug(
+                    "Failed to resolve model for rehydrated slot %s", slot_name, exc_info=True
+                )
         if meta.get("reasoning_effort"):
             slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
         if meta.get("workspace"):
@@ -669,9 +666,7 @@ def _rehydrate_slot_from_history(
             # returns the identical window whether it is written before or after.
             # Kept off the loop because update_metadata enters _locked (flock +
             # os.close), a blocking-on-loop-prohibited op.
-            update_metadata_off_loop(
-                state.conversation_log, history_key, {"tab_id": tab_id}
-            )
+            update_metadata_off_loop(state.conversation_log, history_key, {"tab_id": tab_id})
         # Only the recent window is loaded into memory; older on-disk lines become
         # the FROZEN PREFIX that saves never rewrite. _disk_older_count must
         # therefore count those older lines so the save model preserves them.
@@ -1006,9 +1001,7 @@ def _restore_recent_sessions_steps(
             # restore_recent_sessions runs during on_startup (event loop live)
             # — keep the _locked flock/os.close off the loop via the off-loop
             # backfill helper.
-            update_metadata_off_loop(
-                state.conversation_log, key, {"tab_id": tab_id}
-            )
+            update_metadata_off_loop(state.conversation_log, key, {"tab_id": tab_id})
         slot._tab_id = tab_id
         messages = state.conversation_log.read_messages_chained(key)
         slot._disk_older_count = max(0, len(messages) - 500)
@@ -1263,8 +1256,7 @@ def _build_message_entry(m: dict) -> dict | None:
         _entry_cache[key] = (entry, size)
         _entry_cache_bytes += size
         while _entry_cache and (
-            len(_entry_cache) > _ENTRY_CACHE_MAX
-            or _entry_cache_bytes > _ENTRY_CACHE_MAX_BYTES
+            len(_entry_cache) > _ENTRY_CACHE_MAX or _entry_cache_bytes > _ENTRY_CACHE_MAX_BYTES
         ):
             _, (_evicted_entry, evicted_size) = _entry_cache.popitem(last=False)
             _entry_cache_bytes -= evicted_size
@@ -1499,12 +1491,7 @@ def _frozen_prefix_and_foreign_appends(
     except OSError:
         return ("", [], [])
     cache = slot._frozen_prefix_cache
-    if (
-        cache is not None
-        and cache[0] == mtime
-        and cache[1] == size
-        and cache[2] == disk_older
-    ):
+    if cache is not None and cache[0] == mtime and cache[1] == size and cache[2] == disk_older:
         # File is byte-identical to our last write → prefix AND the foreign
         # lines that write preserved are both served from cache. Returning the
         # cached foreign lines (a copy, so the caller cannot mutate the cache)
@@ -1597,9 +1584,9 @@ def _frozen_prefix_and_foreign_appends(
 
     # Parse the on-disk window-region lines once (skipping blank/corrupt/transient
     # lines exactly as before), so the matching passes share one parse.
-    disk_msgs: list[
-        tuple[str, object, object, object, str | None]
-    ] = []  # (norm, ts, role, content, mid)
+    disk_msgs: list[tuple[str, object, object, object, str | None]] = (
+        []
+    )  # (norm, ts, role, content, mid)
     for ln in body[disk_older:]:
         if not ln.strip():
             continue
@@ -1613,9 +1600,7 @@ def _frozen_prefix_and_foreign_appends(
         if role is None or role in _TRANSIENT_ROLES:
             continue
         norm = ln if ln.endswith("\n") else ln + "\n"
-        disk_msgs.append(
-            (norm, entry.get("ts"), role, entry.get("content", ""), row_mid(entry))
-        )
+        disk_msgs.append((norm, entry.get("ts"), role, entry.get("content", ""), row_mid(entry)))
 
     # Pass 0 — ``meta.mid``: id-first identity, resolved across ALL disk lines
     # before any heuristic tier so a greedy lower-confidence match can never
@@ -1842,9 +1827,7 @@ def _save_slot_to_history(
         history_key = slot_history_key(slot)
         if getattr(slot, "linked_session_key", "") == routing:
             break
-    kept = [
-        m for m in window if not _note_authorized_elsewhere(m.get("meta"), note_auth_key)
-    ]
+    kept = [m for m in window if not _note_authorized_elsewhere(m.get("meta"), note_auth_key)]
     dropped_notes = len(window) - len(kept)
     window = kept
     if dropped_notes:
@@ -1874,6 +1857,31 @@ def _save_slot_to_history(
             note_auth_key,
         )
     if not window:
+        if force:
+            # A FORCED save of a message-less slot is a metadata mutation (folder
+            # filing/unfiling, from the folder PATCH route or the folder-delete
+            # sweep) -- the full save below has no window to write, but the
+            # placement still has to reach disk. This became reachable when
+            # `session_create` started persisting `folder_id` at birth (#6118):
+            # an empty newborn HAS a metadata line, so moving or unfiling it (or
+            # deleting its folder) before its first message must overwrite that
+            # line, or a restart resurrects the birth placement the user already
+            # changed. Merged ONLY into an existing line: a slot with no line at
+            # all does not survive a restart, so there is nothing to reconcile,
+            # and materializing files for every empty tab here would create
+            # transcripts nothing else expects. The existence guard runs INSIDE
+            # the same cross-process lock as the merge (`update_metadata_if`):
+            # the plain update is an upsert, so a checked-then-written pair
+            # would let a permanent deletion land between the two and be
+            # resurrected as a fresh file. `folder_id` is written even when
+            # empty -- the merge cannot delete a key, and rehydrate treats a
+            # falsy value as unfiled. Fails closed on an unreadable record, per
+            # `update_metadata_if`'s own contract.
+            state.conversation_log.update_metadata_if(
+                history_key,
+                {"folder_id": slot.folder_id or ""},
+                lambda meta: bool(meta),
+            )
         return
     # Skip a pure no-op: a freshly resumed slot with no new AND no edited
     # messages. ``slot._dirty`` is set by both append and in-place edits
@@ -2095,14 +2103,10 @@ def _save_slot_to_history(
                 or _approx_window_payload_bytes(window) > _ENTRY_CACHE_MAX_BYTES
                 else _build_message_entry
             )
-            window_entries = [
-                e for m in window if (e := build_entry(m)) is not None
-            ]
+            window_entries = [e for m in window if (e := build_entry(m)) is not None]
             window_lines = [json.dumps(e) + "\n" for e in window_entries]
-            frozen_prefix, foreign_lines, dedup_dropped = (
-                _frozen_prefix_and_foreign_appends(
-                    slot, path, disk_older, window_entries, collect_foreign=not rewrite
-                )
+            frozen_prefix, foreign_lines, dedup_dropped = _frozen_prefix_and_foreign_appends(
+                slot, path, disk_older, window_entries, collect_foreign=not rewrite
             )
             # A fresh-``ts`` disk copy folded into the window by the bounded
             # (role, content) tiebreak is redundant with a window entry, so the
@@ -2112,22 +2116,18 @@ def _save_slot_to_history(
             # the trade-off loses no data permanently.
             if dedup_dropped:
                 try:
-                    base = (
-                        state.conversation_log._dir
-                        if state.conversation_log
-                        else None
-                    )
-                    _archive_lines(
-                        history_key, dedup_dropped, reason="foreign-dedup", base=base
-                    )
+                    base = state.conversation_log._dir if state.conversation_log else None
+                    _archive_lines(history_key, dedup_dropped, reason="foreign-dedup", base=base)
                 except Exception:
                     logger.warning(
                         "Failed to archive foreign-dedup drops for %s",
                         history_key,
                         exc_info=True,
                     )
-            payload = meta_str + frozen_prefix + "".join(
-                _interleave_foreign_lines(window_entries, window_lines, foreign_lines)
+            payload = (
+                meta_str
+                + frozen_prefix
+                + "".join(_interleave_foreign_lines(window_entries, window_lines, foreign_lines))
             )
 
             # Refresh the slot's ordering floor from what is actually going to

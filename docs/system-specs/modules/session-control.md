@@ -15,7 +15,7 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 
 | Tool | Route | What it does |
 |------|-------|--------------|
-| `session_create` | `POST /api/session-control/create` | Open a new, empty session in the caller's workspace |
+| `session_create` | `POST /api/session-control/create` | Open a new, empty session in the caller's workspace, optionally filed into a sidebar folder at creation |
 | `session_stop` | `POST /api/session-control/stop` | Stop another session's in-flight turn |
 | `session_read_message` | `GET /api/session-control/read` | Read another session's transcript tail + liveness |
 
@@ -43,6 +43,24 @@ hand the person a key they can read and stop. Without it the person does that by
 hand -- new tab, retype the title, pick the agent -- and the two observation verbs
 have nothing to point at that the agent itself put there. It deliberately does
 NOT seed a first message: that would be delivery.
+
+`session_create` also takes an optional `folder` — a folder id or `/`-separated
+human path, resolved with `chat_folder_create`'s `parent` semantics (missing
+segments created, behind the same tree-shaping gate) — and files the slot as
+part of creation (#6118). Filing used to be a second call
+(`chat_folder_move_session`), and the window between the two was a real defect
+path: a folder deleted in between left the session unfiled with the create
+already done. The handler assigns `folder_id` inside the same synchronous window
+that configures the slot, holds `suspend_slots_push` across the whole
+allocation-to-persist span (so the slot's first broadcast frame already shows it
+filed, and a slot whose birth write fails is never broadcast at all), and
+carries the placement in the persist-at-birth metadata, so no caller or client
+ever observes an unfiled session and the placement survives a restart.
+An unresolvable folder refuses the whole create — nothing exists yet, so refusal
+loses nothing — existence is confirmed read-only under the folder-store lock
+(`read_folders`) before the allocation, and the move path's Model-B un-hide runs
+only after the filing has landed, so a refused create leaves no folder-tree
+mutation behind.
 
 `kirocrew-dashboard` rather than `kirocrew-core`, because these tools are not a
 capability every session should carry. That server is an **assignable set**: it
