@@ -267,7 +267,9 @@ async def api_agent_config(request: web.Request) -> web.Response:
             # other JSON type (list, dict, number) would flow into the sidecar
             # helper as a dict key and crash the endpoint with a 500.
             raw_name = config.get("name")
-            name = raw_name if isinstance(raw_name, str) and raw_name.strip() else installed_path.stem
+            name = (
+                raw_name if isinstance(raw_name, str) and raw_name.strip() else installed_path.stem
+            )
             changed = await asyncio.to_thread(agent_state.lift_and_strip_bookkeeping, config, name)
             if changed:
                 logger.info(
@@ -280,7 +282,24 @@ async def api_agent_config(request: web.Request) -> web.Response:
             # write_config_atomically writes to a temp file then os.replace,
             # matching the same pattern already used for the mc_cfg sidecar
             # above (line 239) and the other config writes in this file.
-            await asyncio.to_thread(write_config_atomically, installed_path, config)
+            #
+            # Under the MCP transaction lock, and through the SHIELDED offload:
+            # agent spec files are a census source for Disconnect's ownership
+            # oracle, which judges and acts inside _get_mcp_lock. A bare
+            # to_thread would let a CANCELLED request unwind and release the lock
+            # while the worker kept writing -- Disconnect then takes the lock,
+            # reads the old census, revokes, and only then does the worker
+            # publish an entry whose authorization was just deleted.
+            # _offload_config_write drains the worker before the lock is
+            # released. External writers (kiro-cli, hand edits) cannot be
+            # serialized, but the gateway must not race itself.
+            from kiro_crew.dashboard.handlers.mcp import (
+                _get_mcp_lock,
+                _offload_config_write,
+            )
+
+            async with _get_mcp_lock():
+                await _offload_config_write(write_config_atomically, installed_path, config)
             # Restart kiro-cli sessions so new config takes effect
             await _h._reset_all_sessions(request)
             return web.json_response({"ok": True, "applied": True})
@@ -742,6 +761,7 @@ async def api_agents_installed(request: web.Request) -> web.Response:
     (``resolve_agent_bindings(..., project_dir=...)``), spawn validation, and
     Slack — see ``agent_discovery.project_agent_names``.
     """
+
     # list_agents() does glob + per-file resolve(strict=True) + read_bytes +
     # json.loads over ~/.kiro/agents — blocking filesystem work that, on a large
     # agents dir (network home, many project-registry agents), can stall the
@@ -974,8 +994,11 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
             # After "auto", never before it: "auto" is the configured default in
             # the general case and leads the list.
             merged.insert(
-                1 if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
-                else 0,
+                (
+                    1
+                    if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
+                    else 0
+                ),
                 {
                     "model_name": canonical_default,
                     "display_name": canonical_default,
@@ -1888,9 +1911,7 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             return web.json_response({"error": f"Agent '{name}' already exists"}, status=409)
         model_reason = _model_pin_rejected(model, request, cfg.agent.provider)
         if model_reason:
-            return web.json_response(
-                {"error": model_reason, "code": "invalid_model"}, status=400
-            )
+            return web.json_response({"error": model_reason, "code": "invalid_model"}, status=400)
         cfg.agents[name] = KiroCrewAgentConfig(
             kiro_agent=kiro_agent,
             workspace=body.get("workspace", "default"),

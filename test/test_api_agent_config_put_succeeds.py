@@ -109,7 +109,10 @@ async def test_api_agent_config_put_strips_governed_grants(tmp_path, monkeypatch
         patch("kiro_crew.dashboard.handlers._find_agent_config", return_value=defaults),
         patch("kiro_crew.dashboard.handlers._reset_all_sessions", new_callable=AsyncMock),
         patch("kiro_crew.dashboard.handlers.config_path", return_value=mc_cfg),
-        patch("kiro_crew.dashboard.handlers.agents.get_shipped_tools", return_value={"tools": [], "allowedTools": []}),
+        patch(
+            "kiro_crew.dashboard.handlers.agents.get_shipped_tools",
+            return_value={"tools": [], "allowedTools": []},
+        ),
     ):
         response = await api_agent_config(request)
 
@@ -291,3 +294,131 @@ async def test_api_agent_config_put_uses_atomic_write(tmp_path):
     )
     _, written_data = installed_spec_calls[0]
     assert written_data.get("name") == "test"
+
+
+@pytest.mark.asyncio
+async def test_agent_config_write_holds_the_mcp_transaction_lock(tmp_path):
+    """The agent-spec write participates in the Disconnect transaction lock.
+
+    Agent spec files are a census source for Disconnect's ownership oracle,
+    which judges and acts inside ``_get_mcp_lock``. A config write landing
+    between that census read and the grant unlink would lose its grant to a
+    judgment that never saw it. External writers cannot be serialized; the
+    gateway's own writer must be.
+    """
+    import contextlib
+
+    installed = tmp_path / "kirocrew.json"
+    installed.write_text(json.dumps({"name": "kirocrew"}))
+    defaults = tmp_path / "defaults.json"
+    mc_cfg = tmp_path / "config.json"
+
+    request = MagicMock(spec=web.Request)
+    request.method = "PUT"
+    request.app = {"state": MagicMock()}
+
+    async def mock_json():
+        return {"config": {"name": "test", "tools": ["a"], "allowedTools": ["b"]}}
+
+    request.json = mock_json
+
+    lock_held: list[bool] = []
+    writes: list[tuple[str, bool]] = []
+    holding = False
+
+    @contextlib.asynccontextmanager
+    async def _recording_lock():
+        nonlocal holding
+        holding = True
+        lock_held.append(True)
+        try:
+            yield
+        finally:
+            holding = False
+
+    def _recording_write(path, config):  # noqa: ANN001 - mirrors the real signature
+        writes.append((str(path), holding))
+
+    with (
+        patch("kiro_crew.dashboard.handlers._installed_agent_config", return_value=installed),
+        patch("kiro_crew.dashboard.handlers._find_agent_config", return_value=defaults),
+        patch("kiro_crew.dashboard.handlers._reset_all_sessions", new_callable=AsyncMock),
+        patch("kiro_crew.dashboard.handlers.config_path", return_value=mc_cfg),
+        patch(
+            "kiro_crew.agent.build_agent_config",
+            return_value={"toolsSettings": {}},
+        ),
+        patch(
+            "kiro_crew.dashboard.handlers.agents.get_shipped_tools",
+            return_value={"tools": ["a", "c"], "allowedTools": ["b"]},
+        ),
+        patch(
+            "kiro_crew.dashboard.handlers.mcp._get_mcp_lock",
+            _recording_lock,
+        ),
+        patch(
+            "kiro_crew.dashboard.handlers.agents.write_config_atomically",
+            _recording_write,
+        ),
+    ):
+        resp = await api_agent_config(request)
+
+    assert resp.status == 200
+    # Only the agent-SPEC write must hold the lock: the spec file is a census
+    # source for Disconnect's oracle. The config.json sidecar write is not.
+    spec_writes = [held for path, held in writes if path == str(installed)]
+    assert spec_writes, "the agent-spec write never happened"
+    assert all(spec_writes), "the agent-spec write ran OUTSIDE the MCP lock"
+
+
+@pytest.mark.asyncio
+async def test_agent_config_write_drains_the_worker_on_cancellation(tmp_path):
+    """The spec write goes through the SHIELDED offload, not a bare to_thread.
+
+    Holding the lock is not enough. A cancelled PUT unwinds the async context
+    and releases `_get_mcp_lock` while a bare `asyncio.to_thread` worker keeps
+    writing, so a Disconnect can take the lock, read the OLD census, revoke the
+    grant, and only then have the worker publish an entry whose authorization
+    was just deleted. `_offload_config_write` exists for exactly this: it drains
+    the worker before the lock is released (its own drain behaviour is pinned in
+    mcp.py). This asserts the spec write is routed through it -- the structural
+    property that makes the cancellation window unrepresentable.
+    """
+    installed = tmp_path / "kirocrew.json"
+    installed.write_text(json.dumps({"name": "kirocrew"}))
+    defaults = tmp_path / "defaults.json"
+    mc_cfg = tmp_path / "config.json"
+
+    request = MagicMock(spec=web.Request)
+    request.method = "PUT"
+    request.app = {"state": MagicMock()}
+
+    async def mock_json():
+        return {"config": {"name": "test", "tools": ["a"], "allowedTools": ["b"]}}
+
+    request.json = mock_json
+
+    offloaded: list[str] = []
+
+    async def _recording_offload(fn, *args, **kwargs):
+        offloaded.append(getattr(fn, "__name__", repr(fn)))
+        return fn(*args, **kwargs)
+
+    with (
+        patch("kiro_crew.dashboard.handlers._installed_agent_config", return_value=installed),
+        patch("kiro_crew.dashboard.handlers._find_agent_config", return_value=defaults),
+        patch("kiro_crew.dashboard.handlers._reset_all_sessions", new_callable=AsyncMock),
+        patch("kiro_crew.dashboard.handlers.config_path", return_value=mc_cfg),
+        patch("kiro_crew.agent.build_agent_config", return_value={"toolsSettings": {}}),
+        patch(
+            "kiro_crew.dashboard.handlers.agents.get_shipped_tools",
+            return_value={"tools": ["a", "c"], "allowedTools": ["b"]},
+        ),
+        patch("kiro_crew.dashboard.handlers.mcp._offload_config_write", _recording_offload),
+    ):
+        resp = await api_agent_config(request)
+
+    assert resp.status == 200
+    assert "write_config_atomically" in offloaded, (
+        "the agent-spec write did not go through the shielded offload: " f"{offloaded}"
+    )

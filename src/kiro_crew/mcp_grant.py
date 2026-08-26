@@ -1,9 +1,10 @@
 """Presence of kiro-cli's MCP OAuth grant artifacts.
 
-A leaf module on purpose. Three callers need this — ``connections.mint`` (the
+A leaf module on purpose. Four callers need this — ``connections.mint`` (the
 curated-provider consent flow), ``connections.status`` (the persisted
-connection view), and ``mcp_discovery``'s remote probe (any url a user
-configured) — and each of the obvious alternatives is closed:
+connection view), ``mcp_discovery``'s remote probe (any url a user
+configured), and the dashboard's disconnect handler (which deletes the pair) —
+and each of the obvious alternatives is closed:
 
 * Keeping it in ``connections.mint`` forces the probe into a *runtime* import,
   because ``mint`` reaches the agent and ACP layers and
@@ -21,7 +22,10 @@ module-scope import. Dependencies are stdlib plus ``hooks`` for the audit, which
 every caller already imports — nothing here pulls the agent or ACP layers in.
 
 Nothing in this module OPENS a token file: the artifacts are stat-ed for
-presence, so no credential material can enter the process through it.
+presence and unlinked by name, so no credential material can enter the process
+through it. Deleting them is grant LIFECYCLE management rather than credential
+access, and it lives here for the same reason the layout does -- the disconnect
+handler is a fourth caller, and it cannot import ``connections.mint`` at all.
 """
 
 from __future__ import annotations
@@ -48,6 +52,10 @@ _DEFAULT_HTTPS_PORT = 443
 # The value keeps its original spelling because that registry key is the contract,
 # not the module this code happens to live in.
 _GRANT_PRESENCE_READ_ID = "connections_mint.oauth_grant_presence"
+# Two passes, not a spin: the second exists so a transient unlink failure (a
+# lock, a slow network home) does not strand a survivor, while a third would
+# only delay reporting a failure that is real.
+_GRANT_REVOKE_ATTEMPTS = 2
 
 
 def kiro_oauth_cache_dir(*, home: Path | None = None) -> Path:
@@ -134,6 +142,99 @@ def grant_presence(mcp_url: str, *, cache_dir: Path | None = None) -> bool | Non
     if None in verdicts:
         return None
     return True
+
+
+def _labelled_grant_artifacts(
+    mcp_url: str, *, cache_dir: Path | None = None
+) -> tuple[tuple[str, Path], ...]:
+    """The grant artifacts for ``mcp_url``, each paired with a stable label.
+
+    One place binds a label to a path, so a caller can name *which* artifact
+    survived without publishing the cache key: the filenames are a sha256 over
+    the provider URL and carry nothing a caller needs. Destructures
+    :func:`grant_artifact_paths` explicitly rather than zipping it, so the
+    token/registration pairing is stated rather than positional.
+    """
+    token, registration = grant_artifact_paths(mcp_url, cache_dir=cache_dir)
+    return (("token", token), ("registration", registration))
+
+
+def surviving_grant_artifacts(mcp_url: str, *, cache_dir: Path | None = None) -> list[str]:
+    """Labels of the grant artifacts that may still be on disk for ``mcp_url``.
+
+    Presence only, the same boundary :func:`grant_presence` keeps: the paths are
+    stat-ed and never opened. This exists so a caller can *state* whether the
+    local grant is gone instead of inferring it from what a delete loop believed
+    it removed.
+
+    An UNREADABLE artifact counts as surviving. :func:`artifact_presence` answers
+    three ways and only a definitive absence clears a label: a permission error or
+    a stalled mount means nobody can say the credential went, and reporting it as
+    gone is the one wrong answer -- it tells the user this machine's connection is
+    dead while a usable refresh token may still be sitting there. Collapsing the
+    tri-state to a boolean here (``Path.is_file`` does exactly that, and swallows
+    every ``OSError`` from Python 3.14) is what would produce that claim.
+
+    Blocking for the same reason as :func:`grant_presence` -- it stalls as long as
+    a network-mounted home does -- so async callers route it off the event loop.
+    """
+    return [
+        label
+        for label, path in _labelled_grant_artifacts(mcp_url, cache_dir=cache_dir)
+        if artifact_presence(path) is not False
+    ]
+
+
+def revoke_local_grant(mcp_url: str, *, cache_dir: Path | None = None) -> list[str]:
+    """Unlink the runtime's stored OAuth artifacts for ``mcp_url``.
+
+    Grant LIFECYCLE management, not credential access: each artifact is removed
+    with ``unlink`` and never opened, so no token or refresh-token byte can enter
+    this process. That is the boundary this module keeps -- kiro-cli owns the OAuth
+    chain and its store, and the gateway may observe and delete but never read.
+
+    Deleting is what makes Disconnect mean something locally. Taking the entry
+    out of the MCP config alone leaves a usable refresh token on disk, so a later
+    reconnect silently resumes the old grant instead of asking for consent. It
+    does NOT revoke at the provider -- only the provider can do that -- which is
+    why the card still sends the user to the provider's revoke page.
+
+    The artifacts are a PAIR and their removal is verified as one: an artifact
+    that fails to unlink is announced at warning level and the pass is retried,
+    and any survivor is named. Reporting only what came off, with the per
+    -artifact failure buried at debug, is what would let a Disconnect delete the
+    token, leave the registration behind, and still answer "done".
+
+    The CALLER decides whether the grant is ours to delete, and must still hold
+    the lock that decided it -- see
+    :func:`kiro_crew.dashboard.handlers.connections._remove_provider_entry`.
+    Nothing here re-checks ownership.
+
+    Returns the labels actually removed, for the audit record.
+    """
+    removed: list[str] = []
+    surviving: list[str] = []
+    for _attempt in range(_GRANT_REVOKE_ATTEMPTS):
+        # The single-file `{sha256}.json` form this directory also holds belongs
+        # to AWS SSO and is deliberately never touched.
+        for label, path in _labelled_grant_artifacts(mcp_url, cache_dir=cache_dir):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                logger.warning("Could not unlink the %s grant artifact", label, exc_info=True)
+                continue
+            if label not in removed:
+                removed.append(label)
+        surviving = surviving_grant_artifacts(mcp_url, cache_dir=cache_dir)
+        if not surviving:
+            return removed
+    logger.warning(
+        "Grant artifacts survived the revoke and the connection may still be usable: %s",
+        ", ".join(surviving),
+    )
+    return removed
 
 
 async def grant_observed(mcp_url: str, *, audit_absence: bool = False) -> bool | None:
