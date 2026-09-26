@@ -364,3 +364,130 @@ async def reclaim_stale_gateway_port(
         " ".join(str(p) for p in kiro_pids),
     )
     return RECLAIM_FAILED
+
+
+# Superseded-gateway reclaim (opt-in, in-place upgrade only).
+SUPERSEDED_NO_HOLDER = "no_holder"      # nothing holds the port — retry will bind
+SUPERSEDED_UNAVAILABLE = "unavailable"  # holder lookup tool absent — cannot act
+SUPERSEDED_FOREIGN = "foreign_holder"   # a non-KiroCrew process — never touched
+SUPERSEDED_RECLAIMED = "reclaimed"      # KiroCrew holder terminated; port should be free
+SUPERSEDED_FAILED = "reclaim_failed"    # holder identified but could not be killed
+
+
+async def reclaim_superseded_gateway_port(
+    port: int,
+    *,
+    list_listeners: Callable[[int], list[int] | None] = _listeners_on_port,
+    is_kirocrew: Callable[[int], bool] | None = None,
+    terminate: Callable[[list[int]], Awaitable[bool]] | None = None,
+    identity_timeout: float = 5.0,
+    log: logging.Logger = logger,
+) -> str:
+    """Reclaim *port* from a **live but superseded** KiroCrew gateway on an upgrade.
+
+    This is the deliberate counterpart to :func:`reclaim_stale_gateway_port`, and
+    the ONE case that function correctly refuses: an in-place version upgrade
+    replaces the installed bytes but does not stop the gateway the previous
+    version left running. That predecessor keeps the process-lifetime singleton
+    lock (:class:`kiro_crew.gateway_lock.GatewayLock`) and its dashboard port
+    bound, and — because it is often still answering HTTP — the stale-port path
+    classifies it as a :data:`HEALTHY_PEER` and leaves it alone. The freshly
+    installed gateway then never binds, never (re)starts the MCP gateway daemon,
+    and every pooled MCP stub connect fails ("connect failed: [WinError 2]" on
+    Windows / socket ENOENT on POSIX). To the user the app "does not start".
+
+    Unlike :func:`reclaim_stale_gateway_port`, this DOES terminate a holder that
+    answers HTTP — the caller has asserted (via the opt-in in
+    :mod:`kiro_crew.cli`) that this start is an upgrade takeover of *this same
+    home*, so the incumbent is a predecessor to retire, not a peer to protect.
+    The safety floor that remains is the one that matters: a holder is signalled
+    ONLY when it is verifiably a KiroCrew gateway process (the same structural
+    argv check that gates ``kirocrew stop`` and reclaim). A foreign process that
+    merely grabbed the port is never touched — the caller must free it or pick
+    another port.
+
+    Every collaborator is injectable so the decision logic is unit-testable
+    without real processes, ``lsof``/``netstat``, or process-killing signals —
+    mirroring :func:`reclaim_stale_gateway_port`. Returns one of the
+    ``SUPERSEDED_*`` outcome constants; only :data:`SUPERSEDED_RECLAIMED` (and,
+    transiently, :data:`SUPERSEDED_NO_HOLDER`) means the port is now bindable.
+    """
+    listeners = await asyncio.to_thread(list_listeners, port)
+    if listeners is None:
+        log.warning(
+            "Upgrade takeover: cannot identify what holds port %d (listener tool "
+            "unavailable) — not reclaiming.",
+            port,
+        )
+        return SUPERSEDED_UNAVAILABLE
+    if not listeners:
+        return SUPERSEDED_NO_HOLDER
+
+    checker: Callable[[int], bool]
+    if is_kirocrew is not None:
+        checker = is_kirocrew
+    else:
+        try:
+            from kiro_crew.cli_server import _is_kirocrew_process
+        except Exception:  # pragma: no cover - import shape is stable
+            log.warning(
+                "Upgrade takeover: cannot load the gateway identity check — not "
+                "reclaiming port %d.",
+                port,
+            )
+            return SUPERSEDED_UNAVAILABLE
+        checker = _is_kirocrew_process
+
+    # Run the identity filter off the event loop and cap it: the shared
+    # identity check shells out to ps/WMI with no timeout of its own, so a
+    # wedged lookup would otherwise hang startup. A timeout degrades to
+    # "not reclaiming" rather than blocking the boot the takeover exists to
+    # unblock.
+    try:
+        kiro_pids = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: list(dict.fromkeys(pid for pid in listeners if checker(pid)))
+            ),
+            timeout=identity_timeout,
+        )
+    except (FileNotFoundError, asyncio.TimeoutError):
+        log.warning(
+            "Upgrade takeover: identity check for port %d did not complete — not "
+            "reclaiming.",
+            port,
+        )
+        return SUPERSEDED_UNAVAILABLE
+
+    if not kiro_pids:
+        log.error(
+            "Upgrade takeover: port %d is held by a non-KiroCrew process (pid %s) "
+            "— refusing to terminate it. Free the port or choose another with "
+            "--port.",
+            port,
+            _describe_holders(listeners),
+        )
+        return SUPERSEDED_FOREIGN
+
+    if terminate is None:
+        terminate = _terminate_pids
+    log.warning(
+        "Upgrade takeover: retiring the superseded KiroCrew gateway (pid %s) that "
+        "still holds port %d so the newly installed gateway can bind.",
+        _describe_holders(kiro_pids),
+        port,
+    )
+    ok = await terminate(kiro_pids)
+    if ok:
+        log.warning(
+            "Upgrade takeover: reclaimed port %d from the superseded gateway (pid %s).",
+            port,
+            kiro_pids,
+        )
+        return SUPERSEDED_RECLAIMED
+    log.error(
+        "Upgrade takeover: failed to terminate the superseded gateway (pid %s) on "
+        "port %d — stop it manually (kirocrew stop) and relaunch.",
+        _describe_holders(kiro_pids),
+        port,
+    )
+    return SUPERSEDED_FAILED

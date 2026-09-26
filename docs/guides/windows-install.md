@@ -66,6 +66,20 @@ Current status:
   the installer also converts a legacy `/S --updated` launch back to this same
   visible path, which covers the first upgrade from clients that predate the
   change.
+- **Upgrade takeover of a superseded gateway** — an in-place upgrade normally
+  stops the previous gateway before relaunching, but if that predecessor is
+  still running when the new gateway starts, it holds this data home's
+  `gateway.lock` and its dashboard port, so the fresh gateway is refused, never
+  (re)starts the MCP gateway daemon, and every pooled MCP stub connect fails
+  (`connect failed: [WinError 2] The system cannot find the file specified` in
+  `logs/stub_fallback.jsonl`) — the app appears not to start. When the launcher
+  sets `KIROCREW_RECLAIM_ON_START=1`, the starting gateway retires that
+  superseded KiroCrew gateway once (verified as a KiroCrew process, then a
+  `taskkill /T` tree stop that reaps its kiro-cli / MCP children) and retries the
+  lock. It is off by default so two intentional gateways on one home still fail
+  closed, and it never terminates a non-KiroCrew process that merely holds the
+  port. For manual recovery on an older client, run
+  `scripts/recover-gateway.ps1 -Fix -Relaunch` (POSIX twin: `recover-gateway.sh`).
 - **Guided Kiro Crew artwork** — the welcome and finish pages use the existing
   Kiro Crew logo and ghost family in the native NSIS sidebar, and intermediate
   pages retain a compact branded header. Buttons, progress, install-mode copy,

@@ -573,6 +573,44 @@ def _diagnostic_port(gw_kwargs: dict) -> int | None:
         return None
 
 
+def _reclaim_on_start_requested() -> bool:
+    """Whether the launcher opted this start into an upgrade takeover.
+
+    Off by default: the single-writer guard fails closed unless the operator or
+    the desktop launcher explicitly sets ``KIROCREW_RECLAIM_ON_START`` (to a
+    truthy ``1``/``true``/``yes``/``on``). Set it on the relaunch that follows an
+    in-place upgrade — never on an ordinary start, where a refused lock is a
+    correct "another gateway owns this home".
+    """
+    val = os.environ.get("KIROCREW_RECLAIM_ON_START", "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _try_reclaim_superseded_gateway(port: int | None) -> bool:
+    """Retire a live-but-superseded KiroCrew gateway holding *port*, once.
+
+    Returns ``True`` when the port was reclaimed (the caller should retry the
+    lock), ``False`` otherwise — no port to resolve, a foreign holder, an absent
+    listener tool, or a failed terminate. Never raises: a takeover attempt that
+    cannot complete degrades to the normal fail-closed refusal.
+    """
+    if port is None:
+        return False
+    try:
+        # Deferred import (issue #3504): keep the dashboard package off cli.py's
+        # module scope so non-gateway commands never import it.
+        from kiro_crew.dashboard.port_reclaim import (
+            SUPERSEDED_RECLAIMED,
+            reclaim_superseded_gateway_port,
+        )
+
+        outcome = asyncio.run(reclaim_superseded_gateway_port(port))
+    except Exception:
+        logger.warning("Upgrade takeover reclaim failed", exc_info=True)
+        return False
+    return outcome == SUPERSEDED_RECLAIMED
+
+
 def _knowledge(args) -> None:
     """``kirocrew knowledge dedup [--apply]`` -- collapse cross-source duplicate docs."""
     if getattr(args, "knowledge_action", None) != "dedup":
@@ -2415,8 +2453,27 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         try:
             _gw_lock = GatewayLock(config_dir(), port=_diagnostic_port(gw_kwargs)).acquire()
         except GatewayLockError as exc:
-            print(f"👻 {exc}", file=sys.stderr)
-            sys.exit(1)
+            # In-place upgrade takeover: an installer that replaced the bytes but
+            # left the previous gateway running holds this home's lock and its
+            # port, so a straight relaunch is refused forever and the app "does
+            # not start". When the launcher explicitly opts in
+            # (KIROCREW_RECLAIM_ON_START), retire that superseded KiroCrew
+            # gateway once and retry the lock. Off by default so two intentional
+            # gateways on one home still fail closed — the single-writer
+            # invariant is unchanged unless the operator asked for a takeover.
+            if _reclaim_on_start_requested() and _try_reclaim_superseded_gateway(
+                _diagnostic_port(gw_kwargs)
+            ):
+                try:
+                    _gw_lock = GatewayLock(
+                        config_dir(), port=_diagnostic_port(gw_kwargs)
+                    ).acquire()
+                except GatewayLockError as exc2:
+                    print(f"👻 {exc2}", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                print(f"👻 {exc}", file=sys.stderr)
+                sys.exit(1)
         try:
             asyncio.run(_gateway(**gw_kwargs))
         finally:

@@ -345,3 +345,115 @@ def test_listeners_posix_tool_absent_returns_none(monkeypatch) -> None:
 
     monkeypatch.setattr(pr.subprocess, "check_output", _never)
     assert pr._listeners_on_port(5476) is None
+
+
+
+# ---------------------------------------------------------------------------
+# reclaim_superseded_gateway_port — the in-place-upgrade takeover path
+#
+# The one case reclaim_stale_gateway_port correctly refuses: a live, HTTP-
+# answering predecessor left running by an in-place upgrade. Here the caller has
+# asserted an upgrade takeover of the SAME home, so a healthy KiroCrew holder IS
+# retired — but a foreign process is still never touched.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_superseded_unavailable_when_listener_tool_absent() -> None:
+    outcome = await pr.reclaim_superseded_gateway_port(
+        5476, list_listeners=lambda _p: None
+    )
+    assert outcome == pr.SUPERSEDED_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_superseded_no_holder_when_port_free() -> None:
+    outcome = await pr.reclaim_superseded_gateway_port(
+        5476, list_listeners=lambda _p: []
+    )
+    assert outcome == pr.SUPERSEDED_NO_HOLDER
+
+
+@pytest.mark.asyncio
+async def test_superseded_foreign_holder_is_never_touched() -> None:
+    terminate_called = False
+
+    async def _terminate(_pids: list[int]) -> bool:
+        nonlocal terminate_called
+        terminate_called = True
+        return True
+
+    outcome = await pr.reclaim_superseded_gateway_port(
+        5476,
+        list_listeners=lambda _p: [4321],
+        is_kirocrew=lambda _pid: False,  # not a KiroCrew process
+        terminate=_terminate,
+    )
+    assert outcome == pr.SUPERSEDED_FOREIGN
+    assert terminate_called is False
+
+
+@pytest.mark.asyncio
+async def test_superseded_healthy_gateway_is_reclaimed() -> None:
+    """The whole point: a LIVE (would-answer-HTTP) KiroCrew predecessor is retired.
+
+    Note there is no health probe here at all — an upgrade takeover terminates a
+    healthy incumbent, which is exactly what reclaim_stale_gateway_port would
+    refuse as a HEALTHY_PEER.
+    """
+    killed: list[int] = []
+
+    async def _terminate(pids: list[int]) -> bool:
+        killed.extend(pids)
+        return True
+
+    outcome = await pr.reclaim_superseded_gateway_port(
+        5476,
+        list_listeners=lambda _p: [1234, 1234, 5678],  # dupes tolerated
+        is_kirocrew=lambda pid: pid in (1234, 5678),
+        terminate=_terminate,
+    )
+    assert outcome == pr.SUPERSEDED_RECLAIMED
+    assert killed == [1234, 5678]
+
+
+@pytest.mark.asyncio
+async def test_superseded_reclaim_failed_when_terminate_returns_false() -> None:
+    async def _terminate(_pids: list[int]) -> bool:
+        return False  # e.g. PermissionError / survived taskkill
+
+    outcome = await pr.reclaim_superseded_gateway_port(
+        5476,
+        list_listeners=lambda _p: [1234],
+        is_kirocrew=lambda _pid: True,
+        terminate=_terminate,
+    )
+    assert outcome == pr.SUPERSEDED_FAILED
+
+
+@pytest.mark.asyncio
+async def test_superseded_slow_identity_check_times_out_to_unavailable() -> None:
+    """A wedged ps/WMI identity check degrades to UNAVAILABLE, never hangs boot."""
+
+    def _slow_checker(_pid: int) -> bool:
+        import time
+
+        time.sleep(5)
+        return True
+
+    terminate_called = False
+
+    async def _terminate(_pids: list[int]) -> bool:
+        nonlocal terminate_called
+        terminate_called = True
+        return True
+
+    outcome = await pr.reclaim_superseded_gateway_port(
+        5476,
+        list_listeners=lambda _p: [1234],
+        is_kirocrew=_slow_checker,
+        terminate=_terminate,
+        identity_timeout=0.2,
+    )
+    assert outcome == pr.SUPERSEDED_UNAVAILABLE
+    assert terminate_called is False
