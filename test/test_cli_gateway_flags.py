@@ -362,3 +362,37 @@ class TestIsReadOnlyTool:
         # ["read", "setter", "field"]. None equal an entry in
         # _WRITE_INDICATORS (which lists "set", not "setter").
         assert _is_read_only_tool("read_setter_field") is True
+
+
+
+# ─── Upgrade-takeover opt-in (KIROCREW_RECLAIM_ON_START) ─────────────────
+
+
+@pytest.mark.parametrize("val", ["1", "true", "TRUE", "Yes", "on", " on "])
+def test_reclaim_on_start_requested_truthy(monkeypatch, val: str) -> None:
+    from kiro_crew.cli import _reclaim_on_start_requested
+
+    monkeypatch.setenv("KIROCREW_RECLAIM_ON_START", val)
+    assert _reclaim_on_start_requested() is True
+
+
+@pytest.mark.parametrize("val", ["0", "false", "no", "off", "", "maybe", "2"])
+def test_reclaim_on_start_requested_falsy(monkeypatch, val: str) -> None:
+    from kiro_crew.cli import _reclaim_on_start_requested
+
+    monkeypatch.setenv("KIROCREW_RECLAIM_ON_START", val)
+    assert _reclaim_on_start_requested() is False
+
+
+def test_reclaim_on_start_requested_unset(monkeypatch) -> None:
+    from kiro_crew.cli import _reclaim_on_start_requested
+
+    monkeypatch.delenv("KIROCREW_RECLAIM_ON_START", raising=False)
+    assert _reclaim_on_start_requested() is False
+
+
+def test_try_reclaim_none_port_is_false() -> None:
+    """No resolvable port -> nothing to reclaim, and no attempt is made."""
+    from kiro_crew.cli import _try_reclaim_superseded_gateway
+
+    assert _try_reclaim_superseded_gateway(None) is False
